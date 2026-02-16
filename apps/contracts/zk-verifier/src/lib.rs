@@ -56,7 +56,11 @@ impl ZkVerifierContract {
         vk_hash
     }
 
-    pub fn verify_proof_with_stored_vk(env: Env, proof_blob: Bytes) -> BytesN<32> {
+    pub fn verify_proof_with_stored_vk(
+        env: Env,
+        proof_blob: Bytes,
+        public_inputs_hash: BytesN<32>,
+    ) -> BytesN<32> {
         let vk_hash: BytesN<32> = env
             .storage()
             .instance()
@@ -64,12 +68,13 @@ impl ZkVerifierContract {
             .or_else(|| env.storage().instance().get(&DataKey::VkHash))
             .expect("vk not set");
 
-        if proof_blob.len() < 33 {
+        if proof_blob.len() < 65 {
             panic_with_error!(&env, Error::InvalidProof);
         }
 
         // Lightweight proof sanity check for contract-level integration tests:
-        // first byte must be 1 and the next 32 bytes must match stored vk hash.
+        // first byte must be 1, bytes [1..33] must match stored vk hash,
+        // bytes [33..65] must match public_inputs_hash.
         let marker = proof_blob.get(0).unwrap_or(0);
         if marker != 1 {
             panic_with_error!(&env, Error::InvalidProof);
@@ -83,6 +88,17 @@ impl ZkVerifierContract {
         }
         let prefix_bn = BytesN::from_array(&env, &prefix);
         if prefix_bn != vk_hash {
+            panic_with_error!(&env, Error::InvalidProof);
+        }
+
+        let mut pub_hash_prefix = [0u8; 32];
+        let mut j = 0u32;
+        while j < 32 {
+            pub_hash_prefix[j as usize] = proof_blob.get(j + 33).unwrap_or(0);
+            j += 1;
+        }
+        let pub_hash_bn = BytesN::from_array(&env, &pub_hash_prefix);
+        if pub_hash_bn != public_inputs_hash {
             panic_with_error!(&env, Error::InvalidProof);
         }
 

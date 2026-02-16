@@ -8,3 +8,6 @@ default-members = [
   "apps/contracts/heist",
   "apps/contracts/zk-verifier"
 ]
+
+[profile.release]
+overflow-checks = true

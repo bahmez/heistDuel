@@ -103,42 +103,6 @@ fn has_any_path(walls: &[u8; BITSET_BYTES], x: i32, y: i32, steps: u32) -> bool 
         || has_any_path(walls, x, y - 1, steps - 1)
 }
 
-pub fn exists_path_exact_len(
-    walls: &[u8; BITSET_BYTES],
-    start: &Position,
-    end: &Position,
-    steps: u32,
-) -> bool {
-    has_path_exact(
-        walls,
-        start.x as i32,
-        start.y as i32,
-        end.x as i32,
-        end.y as i32,
-        steps,
-    )
-}
-
-fn has_path_exact(
-    walls: &[u8; BITSET_BYTES],
-    x: i32,
-    y: i32,
-    tx: i32,
-    ty: i32,
-    steps: u32,
-) -> bool {
-    if !is_walkable(walls, x, y) {
-        return false;
-    }
-    if steps == 0 {
-        return x == tx && y == ty;
-    }
-    has_path_exact(walls, x + 1, y, tx, ty, steps - 1)
-        || has_path_exact(walls, x - 1, y, tx, ty, steps - 1)
-        || has_path_exact(walls, x, y + 1, tx, ty, steps - 1)
-        || has_path_exact(walls, x, y - 1, tx, ty, steps - 1)
-}
-
 pub fn reveal_fog_4x4(fog: &mut [u8; BITSET_BYTES], cx: u32, cy: u32) {
     let start_x = if cx > 0 { cx - 1 } else { 0 };
     let start_y = if cy > 0 { cy - 1 } else { 0 };

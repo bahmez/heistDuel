@@ -58,7 +58,11 @@ pub struct MockVerifierContract;
 
 #[contractimpl]
 impl MockVerifierContract {
-    pub fn verify_proof_with_stored_vk(env: Env, proof_blob: soroban_sdk::Bytes) -> BytesN<32> {
+    pub fn verify_proof_with_stored_vk(
+        env: Env,
+        proof_blob: soroban_sdk::Bytes,
+        _public_inputs_hash: BytesN<32>,
+    ) -> BytesN<32> {
         env.crypto().keccak256(&proof_blob).into()
     }
 }

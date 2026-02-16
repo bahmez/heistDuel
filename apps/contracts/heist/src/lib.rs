@@ -6,10 +6,11 @@ use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short,
     vec, Address, Bytes, BytesN, Env, IntoVal, Vec,
 };
+use soroban_sdk::xdr::ToXdr;
 
 use engine::{
     bit_is_set, bit_set, commit_hash, compute_state_hash, derive_session_seed, exists_any_path_len,
-    exists_path_exact_len, from_arr18, generate_map, has_any_set_bit, is_full_collection, reveal_fog_4x4,
+    from_arr18, generate_map, has_any_set_bit, is_full_collection, reveal_fog_4x4,
     roll_value, to_arr18, zero_bitset, CAMERA_PENALTY, CELL_COUNT, GAME_SECONDS, LASER_PENALTY, MAP_H,
     MAP_W,
 };
@@ -33,7 +34,11 @@ pub trait GameHub {
 
 #[contractclient(name = "ZkVerifierClient")]
 pub trait ZkVerifier {
-    fn verify_proof_with_stored_vk(env: Env, proof_blob: Bytes) -> BytesN<32>;
+    fn verify_proof_with_stored_vk(
+        env: Env,
+        proof_blob: Bytes,
+        public_inputs_hash: BytesN<32>,
+    ) -> BytesN<32>;
 }
 
 #[contracterror]
@@ -108,6 +113,7 @@ pub struct TurnPublic {
     pub no_path_flag: bool,
     pub state_hash_before: BytesN<32>,
     pub state_hash_after: BytesN<32>,
+    pub path: Vec<Position>,
 }
 
 #[contracttype]
@@ -161,6 +167,30 @@ pub struct GameView {
     pub loot_collected: BytesN<18>,
     pub cameras: Vec<Camera>,
     pub lasers: Vec<Laser>,
+    pub winner: Option<Address>,
+    pub last_proof_id: Option<BytesN<32>>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlayerGameView {
+    pub player1: Address,
+    pub player2: Address,
+    pub status: GameStatus,
+    pub started_at_ts: Option<u64>,
+    pub deadline_ts: Option<u64>,
+    pub turn_index: u32,
+    pub active_player: Address,
+    pub player1_pos: Position,
+    pub player2_pos: Position,
+    pub player1_score: i128,
+    pub player2_score: i128,
+    pub loot_collected: BytesN<18>,
+    pub visible_walls: BytesN<18>,
+    pub visible_loot: BytesN<18>,
+    pub visible_cameras: Vec<Camera>,
+    pub visible_lasers: Vec<Laser>,
+    pub my_fog: BytesN<18>,
     pub winner: Option<Address>,
     pub last_proof_id: Option<BytesN<32>>,
 }
@@ -320,6 +350,8 @@ impl HeistContract {
         if game.status != GameStatus::WaitingReveal {
             return Err(Error::InvalidStatus);
         }
+        game.player1.require_auth();
+        game.player2.require_auth();
 
         let p1 = game.p1_seed_reveal.clone().ok_or(Error::SeedsNotReady)?;
         let p2 = game.p2_seed_reveal.clone().ok_or(Error::SeedsNotReady)?;
@@ -413,26 +445,42 @@ impl HeistContract {
                 || public_turn.camera_hits != 0
                 || public_turn.laser_hits != 0
                 || has_any_set_bit(&public_turn.loot_collected_mask_delta)
+                || public_turn.path.len() != 1
+                || public_turn.path.get(0).unwrap_or(Position { x: 0, y: 0 })
+                    != public_turn.start_pos
             {
                 return Err(Error::InvalidNoPathFlag);
             }
             if exists_any_path_len(&walls, &current_pos, rolled) {
                 return Err(Error::InvalidNoPathFlag);
             }
-        } else if !exists_path_exact_len(&walls, &public_turn.start_pos, &public_turn.end_pos, rolled)
-        {
-            return Err(Error::InvalidMoveLength);
+        } else {
+            if !Self::validate_path(&walls, &public_turn.path, rolled) {
+                return Err(Error::InvalidMoveLength);
+            }
+            let path_end = public_turn
+                .path
+                .get(public_turn.path.len() - 1)
+                .unwrap_or(Position { x: 0, y: 0 });
+            if path_end != public_turn.end_pos {
+                return Err(Error::InvalidMoveLength);
+            }
         }
 
+        let expected_turn_hash = Self::compute_turn_public_hash(&env, &public_turn);
         let verifier_addr: Address = env
             .storage()
             .instance()
             .get(&DataKey::VerifierAddress)
             .expect("verifier missing");
         let verifier = ZkVerifierClient::new(&env, &verifier_addr);
-        let proof_id = verifier.verify_proof_with_stored_vk(&proof_blob);
+        let proof_id = verifier.verify_proof_with_stored_vk(&proof_blob, &expected_turn_hash);
 
-        let loot_delta = to_arr18(&public_turn.loot_collected_mask_delta);
+        let loot_delta = if public_turn.no_path_flag {
+            [0u8; 18]
+        } else {
+            Self::collect_loot_delta_from_path(&game.loot, &game.loot_collected, &public_turn.path)?
+        };
         let loot = to_arr18(&game.loot);
         let mut collected = to_arr18(&game.loot_collected);
 
@@ -452,6 +500,19 @@ impl HeistContract {
             i += 1;
         }
 
+        let (expected_camera_hits, expected_laser_hits) = if public_turn.no_path_flag {
+            (0u32, 0u32)
+        } else {
+            Self::compute_hazard_hits(&public_turn.path, &game.cameras, &game.lasers)
+        };
+        if public_turn.camera_hits != expected_camera_hits || public_turn.laser_hits != expected_laser_hits {
+            return Err(Error::InvalidTurnData);
+        }
+
+        if public_turn.loot_collected_mask_delta != from_arr18(&env, &loot_delta) {
+            return Err(Error::InvalidTurnData);
+        }
+
         let expected_delta = loot_points
             - (public_turn.camera_hits as i128) * CAMERA_PENALTY
             - (public_turn.laser_hits as i128) * LASER_PENALTY;
@@ -462,14 +523,20 @@ impl HeistContract {
         game.loot_collected = from_arr18(&env, &collected);
         if player == game.player1 {
             game.player1_pos = public_turn.end_pos.clone();
-            game.player1_score += public_turn.score_delta;
+            game.player1_score = game
+                .player1_score
+                .checked_add(public_turn.score_delta)
+                .ok_or(Error::InvalidScoreDelta)?;
             let mut fog = to_arr18(&game.fog_p1);
             reveal_fog_4x4(&mut fog, game.player1_pos.x, game.player1_pos.y);
             game.fog_p1 = from_arr18(&env, &fog);
             game.active_player = game.player2.clone();
         } else {
             game.player2_pos = public_turn.end_pos.clone();
-            game.player2_score += public_turn.score_delta;
+            game.player2_score = game
+                .player2_score
+                .checked_add(public_turn.score_delta)
+                .ok_or(Error::InvalidScoreDelta)?;
             let mut fog = to_arr18(&game.fog_p2);
             reveal_fog_4x4(&mut fog, game.player2_pos.x, game.player2_pos.y);
             game.fog_p2 = from_arr18(&env, &fog);
@@ -536,6 +603,12 @@ impl HeistContract {
 
     /// Returns a public view of the game state.
     pub fn get_game(env: Env, session_id: u32) -> Result<GameView, Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("admin missing");
+        admin.require_auth();
         let game = Self::require_game(&env, session_id)?;
         Ok(GameView {
             player1: game.player1,
@@ -554,6 +627,85 @@ impl HeistContract {
             loot_collected: game.loot_collected,
             cameras: game.cameras,
             lasers: game.lasers,
+            winner: game.winner,
+            last_proof_id: game.last_proof_id,
+        })
+    }
+
+    /// Returns a player-scoped game view constrained by fog-of-war.
+    pub fn get_player_view(
+        env: Env,
+        session_id: u32,
+        player: Address,
+    ) -> Result<PlayerGameView, Error> {
+        player.require_auth();
+        let game = Self::require_game(&env, session_id)?;
+
+        let my_fog = if player == game.player1 {
+            game.fog_p1.clone()
+        } else if player == game.player2 {
+            game.fog_p2.clone()
+        } else {
+            return Err(Error::NotPlayer);
+        };
+        let fog = to_arr18(&my_fog);
+        let walls = to_arr18(&game.walls);
+        let loot = to_arr18(&game.loot);
+
+        let mut visible_walls = [0u8; 18];
+        let mut visible_loot = [0u8; 18];
+        let mut i = 0u32;
+        while i < CELL_COUNT {
+            if bit_is_set(&fog, i) {
+                if bit_is_set(&walls, i) {
+                    bit_set(&mut visible_walls, i);
+                }
+                if bit_is_set(&loot, i) {
+                    bit_set(&mut visible_loot, i);
+                }
+            }
+            i += 1;
+        }
+
+        let mut visible_cameras = Vec::new(&env);
+        let mut ci = 0u32;
+        while ci < game.cameras.len() {
+            let cam = game.cameras.get(ci).unwrap();
+            let bit = cam.y * MAP_W + cam.x;
+            if bit_is_set(&fog, bit) {
+                visible_cameras.push_back(cam);
+            }
+            ci += 1;
+        }
+
+        let mut visible_lasers = Vec::new(&env);
+        let mut li = 0u32;
+        while li < game.lasers.len() {
+            let laser = game.lasers.get(li).unwrap();
+            if Self::laser_intersects_fog(&laser, &fog) {
+                visible_lasers.push_back(laser);
+            }
+            li += 1;
+        }
+
+        Ok(PlayerGameView {
+            player1: game.player1,
+            player2: game.player2,
+            status: game.status,
+            started_at_ts: game.started_at_ts,
+            deadline_ts: game.deadline_ts,
+            turn_index: game.turn_index,
+            active_player: game.active_player,
+            player1_pos: game.player1_pos,
+            player2_pos: game.player2_pos,
+            player1_score: game.player1_score,
+            player2_score: game.player2_score,
+            loot_collected: game.loot_collected,
+            visible_walls: from_arr18(&env, &visible_walls),
+            visible_loot: from_arr18(&env, &visible_loot),
+            visible_cameras,
+            visible_lasers,
+            my_fog,
             winner: game.winner,
             last_proof_id: game.last_proof_id,
         })
@@ -602,14 +754,20 @@ impl HeistContract {
 
         if public_turn.player == game.player1 {
             game.player1_pos = public_turn.end_pos.clone();
-            game.player1_score += public_turn.score_delta;
+            game.player1_score = game
+                .player1_score
+                .checked_add(public_turn.score_delta)
+                .ok_or(Error::InvalidScoreDelta)?;
             game.active_player = game.player2.clone();
             let mut fog = to_arr18(&game.fog_p1);
             reveal_fog_4x4(&mut fog, game.player1_pos.x, game.player1_pos.y);
             game.fog_p1 = from_arr18(&env, &fog);
         } else {
             game.player2_pos = public_turn.end_pos.clone();
-            game.player2_score += public_turn.score_delta;
+            game.player2_score = game
+                .player2_score
+                .checked_add(public_turn.score_delta)
+                .ok_or(Error::InvalidScoreDelta)?;
             game.active_player = game.player1.clone();
             let mut fog = to_arr18(&game.fog_p2);
             reveal_fog_4x4(&mut fog, game.player2_pos.x, game.player2_pos.y);
@@ -699,6 +857,172 @@ impl HeistContract {
         env.storage()
             .temporary()
             .extend_ttl(&key, GAME_TTL_LEDGERS, GAME_TTL_LEDGERS);
+    }
+
+    fn validate_path(walls: &[u8; 18], path: &Vec<Position>, rolled: u32) -> bool {
+        if path.len() != rolled + 1 {
+            return false;
+        }
+        let mut i = 0u32;
+        while i < path.len() {
+            let p = path.get(i).unwrap();
+            if p.x >= MAP_W || p.y >= MAP_H {
+                return false;
+            }
+            if bit_is_set(walls, p.y * MAP_W + p.x) {
+                return false;
+            }
+            if i > 0 {
+                let prev = path.get(i - 1).unwrap();
+                let dx = if p.x > prev.x { p.x - prev.x } else { prev.x - p.x };
+                let dy = if p.y > prev.y { p.y - prev.y } else { prev.y - p.y };
+                if dx + dy != 1 {
+                    return false;
+                }
+            }
+            i += 1;
+        }
+        true
+    }
+
+    fn collect_loot_delta_from_path(
+        loot: &BytesN<18>,
+        loot_collected: &BytesN<18>,
+        path: &Vec<Position>,
+    ) -> Result<[u8; 18], Error> {
+        let loot_arr = to_arr18(loot);
+        let collected_arr = to_arr18(loot_collected);
+        let mut delta = [0u8; 18];
+
+        let mut i = 0u32;
+        while i < path.len() {
+            let p = path.get(i).unwrap();
+            let bit = p.y * MAP_W + p.x;
+            if bit_is_set(&loot_arr, bit) {
+                if bit_is_set(&collected_arr, bit) {
+                    return Err(Error::LootAlreadyCollected);
+                }
+                bit_set(&mut delta, bit);
+            }
+            i += 1;
+        }
+        Ok(delta)
+    }
+
+    fn compute_hazard_hits(path: &Vec<Position>, cameras: &Vec<Camera>, lasers: &Vec<Laser>) -> (u32, u32) {
+        let mut camera_hits = 0u32;
+        let mut ci = 0u32;
+        while ci < cameras.len() {
+            let cam = cameras.get(ci).unwrap();
+            if Self::path_hits_camera(path, &cam) {
+                camera_hits += 1;
+            }
+            ci += 1;
+        }
+
+        let mut laser_hits = 0u32;
+        let mut li = 0u32;
+        while li < lasers.len() {
+            let laser = lasers.get(li).unwrap();
+            if Self::path_hits_laser(path, &laser) {
+                laser_hits += 1;
+            }
+            li += 1;
+        }
+
+        (camera_hits, laser_hits)
+    }
+
+    fn path_hits_camera(path: &Vec<Position>, camera: &Camera) -> bool {
+        let mut i = 0u32;
+        while i < path.len() {
+            let p = path.get(i).unwrap();
+            let dx = if p.x > camera.x { p.x - camera.x } else { camera.x - p.x };
+            let dy = if p.y > camera.y { p.y - camera.y } else { camera.y - p.y };
+            if dx + dy <= camera.radius {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    fn path_hits_laser(path: &Vec<Position>, laser: &Laser) -> bool {
+        let mut i = 0u32;
+        while i < path.len() {
+            let p = path.get(i).unwrap();
+            if laser.x1 == laser.x2 {
+                if p.x == laser.x1 && p.y >= laser.y1 && p.y <= laser.y2 {
+                    return true;
+                }
+            } else if laser.y1 == laser.y2 && p.y == laser.y1 && p.x >= laser.x1 && p.x <= laser.x2 {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    fn laser_intersects_fog(laser: &Laser, fog: &[u8; 18]) -> bool {
+        if laser.x1 == laser.x2 {
+            let x = laser.x1;
+            let mut y = laser.y1;
+            while y <= laser.y2 {
+                if bit_is_set(fog, y * MAP_W + x) {
+                    return true;
+                }
+                if y == u32::MAX {
+                    break;
+                }
+                y += 1;
+            }
+            return false;
+        }
+
+        if laser.y1 == laser.y2 {
+            let y = laser.y1;
+            let mut x = laser.x1;
+            while x <= laser.x2 {
+                if bit_is_set(fog, y * MAP_W + x) {
+                    return true;
+                }
+                if x == u32::MAX {
+                    break;
+                }
+                x += 1;
+            }
+            return false;
+        }
+
+        false
+    }
+
+    fn compute_turn_public_hash(env: &Env, turn: &TurnPublic) -> BytesN<32> {
+        let mut b = Bytes::new(env);
+        b.append(&Bytes::from_array(env, &turn.session_id.to_be_bytes()));
+        b.append(&Bytes::from_array(env, &turn.turn_index.to_be_bytes()));
+        b.append(&turn.player.clone().to_xdr(env));
+        b.append(&Bytes::from_array(env, &turn.start_pos.x.to_be_bytes()));
+        b.append(&Bytes::from_array(env, &turn.start_pos.y.to_be_bytes()));
+        b.append(&Bytes::from_array(env, &turn.end_pos.x.to_be_bytes()));
+        b.append(&Bytes::from_array(env, &turn.end_pos.y.to_be_bytes()));
+        b.append(&Bytes::from_array(env, &turn.rolled_value.to_be_bytes()));
+        b.append(&Bytes::from_array(env, &turn.score_delta.to_be_bytes()));
+        b.append(&Bytes::from_array(env, &turn.camera_hits.to_be_bytes()));
+        b.append(&Bytes::from_array(env, &turn.laser_hits.to_be_bytes()));
+        b.append(&Bytes::from(turn.loot_collected_mask_delta.clone()));
+        b.push_back(if turn.no_path_flag { 1 } else { 0 });
+        b.append(&Bytes::from(turn.state_hash_before.clone()));
+        b.append(&Bytes::from(turn.state_hash_after.clone()));
+
+        let mut i = 0u32;
+        while i < turn.path.len() {
+            let p = turn.path.get(i).unwrap();
+            b.append(&Bytes::from_array(env, &p.x.to_be_bytes()));
+            b.append(&Bytes::from_array(env, &p.y.to_be_bytes()));
+            i += 1;
+        }
+        env.crypto().keccak256(&b).into()
     }
 }
 

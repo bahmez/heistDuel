@@ -13,6 +13,7 @@
     "dev": "turbo dev",
     "build": "turbo build",
     "build:contracts": "turbo build --filter=@repo/heist --filter=@repo/zk-verifier",
+    "deploy:contracts": "powershell -NoProfile -ExecutionPolicy Bypass -File ./apps/contracts/scripts/deploy.ps1",
     "typecheck": "turbo typecheck",
     "lint": "turbo lint",
     "test": "turbo test",
