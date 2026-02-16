@@ -1,0 +1,68 @@
+substitutions:
+  _API_SERVICE: "api"
+  _WEB_SERVICE: "web"
+  _BRANCH: "main"
+  _REGION: "europe-west1"
+  _NEXT_PUBLIC_API_URL: ""
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+steps:
+  # API build and deploy
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - build
+      - "-f"
+      - "apps/api/Dockerfile"
+      - "--tag=gcr.io/$PROJECT_ID/${_API_SERVICE}-${_BRANCH}:$SHORT_SHA"
+      - "."
+
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - push
+      - "gcr.io/$PROJECT_ID/${_API_SERVICE}-${_BRANCH}:$SHORT_SHA"
+
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - "${_API_SERVICE}-${_BRANCH}"
+      - "--image=gcr.io/$PROJECT_ID/${_API_SERVICE}-${_BRANCH}:$SHORT_SHA"
+      - "--region=${_REGION}"
+      - "--platform=managed"
+      - "--allow-unauthenticated"
+      - "--set-env-vars=NODE_ENV=production"
+
+  # Web build and deploy
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - build
+      - "-f"
+      - "apps/web/Dockerfile"
+      - "--tag=gcr.io/$PROJECT_ID/${_WEB_SERVICE}-${_BRANCH}:$SHORT_SHA"
+      - "--build-arg"
+      - "NEXT_PUBLIC_API_URL=${_NEXT_PUBLIC_API_URL}"
+      - "."
+
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - push
+      - "gcr.io/$PROJECT_ID/${_WEB_SERVICE}-${_BRANCH}:$SHORT_SHA"
+
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - "${_WEB_SERVICE}-${_BRANCH}"
+      - "--image=gcr.io/$PROJECT_ID/${_WEB_SERVICE}-${_BRANCH}:$SHORT_SHA"
+      - "--region=${_REGION}"
+      - "--platform=managed"
+      - "--allow-unauthenticated"
+      - "--set-env-vars=NODE_ENV=production,NEXT_PUBLIC_API_URL=${_NEXT_PUBLIC_API_URL}"
+
+images:
+  - "gcr.io/$PROJECT_ID/${_API_SERVICE}-${_BRANCH}:$SHORT_SHA"
+  - "gcr.io/$PROJECT_ID/${_WEB_SERVICE}-${_BRANCH}:$SHORT_SHA"

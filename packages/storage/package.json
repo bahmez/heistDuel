@@ -1,0 +1,21 @@
+{
+  "name": "@repo/storage",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "build": "echo \"storage: no build step\"",
+    "dev": "echo \"storage: no dev step\"",
+    "typecheck": "tsc --noEmit",
+    "lint": "echo \"storage: no lint step\"",
+    "test": "echo \"storage: no test step\""
+  },
+  "dependencies": {
+    "@repo/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3"
+  }
+}

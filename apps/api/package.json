@@ -1,0 +1,28 @@
+{
+  "name": "@repo/api",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/main.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "echo \"No linter configured for api yet\"",
+    "test": "echo \"No tests yet for api\"",
+    "clean": "rimraf dist"
+  },
+  "dependencies": {
+    "@repo/database": "workspace:*",
+    "@repo/firebase": "workspace:*",
+    "@repo/llm": "workspace:*",
+    "@repo/shared": "workspace:*",
+    "@repo/storage": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.7",
+    "rimraf": "^6.0.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}

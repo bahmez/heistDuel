@@ -1,0 +1,21 @@
+{
+  "name": "@repo/llm",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "build": "echo \"llm: no build step\"",
+    "dev": "echo \"llm: no dev step\"",
+    "typecheck": "tsc --noEmit",
+    "lint": "echo \"llm: no lint step\"",
+    "test": "echo \"llm: no test step\""
+  },
+  "dependencies": {
+    "@repo/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3"
+  }
+}
