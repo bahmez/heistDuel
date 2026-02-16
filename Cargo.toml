@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = [
+  "apps/contracts/heist",
+  "apps/contracts/zk-verifier"
+]
+default-members = [
+  "apps/contracts/heist",
+  "apps/contracts/zk-verifier"
+]

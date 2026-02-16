@@ -5,3 +5,10 @@ dist
 coverage
 .env
 .env.*
+
+# Soroban/Rust contract artifacts
+apps/contracts/**/target/
+apps/contracts/**/test_snapshots/
+apps/contracts/**/.stellar/
+apps/contracts/**/.soroban/
+apps/contracts/**/Cargo.lock

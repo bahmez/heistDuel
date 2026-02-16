@@ -12,9 +12,11 @@
   "scripts": {
     "dev": "turbo dev",
     "build": "turbo build",
+    "build:contracts": "turbo build --filter=@repo/heist --filter=@repo/zk-verifier",
     "typecheck": "turbo typecheck",
     "lint": "turbo lint",
     "test": "turbo test",
+    "test:contracts": "turbo test --filter=@repo/heist --filter=@repo/zk-verifier",
     "clean": "turbo clean"
   },
   "devDependencies": {

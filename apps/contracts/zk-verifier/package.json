@@ -1,0 +1,12 @@
+{
+  "name": "@repo/zk-verifier",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "cargo build --target wasm32-unknown-unknown --release",
+    "test": "cargo test",
+    "typecheck": "cargo check",
+    "lint": "echo \"No linter configured for zk-verifier yet\"",
+    "clean": "cargo clean"
+  }
+}
