@@ -54,6 +54,37 @@ export class ConfigService implements OnModuleInit {
     };
   }
 
+  /**
+   * Normalizes Firestore deployment payloads (current + legacy key shapes)
+   * into AppConfig fields.
+   */
+  private fromDeployment(
+    network: string,
+    latest: Record<string, unknown>,
+  ): AppConfig {
+    const heistContractId = String(
+      (latest.heistContractId ?? latest.heist_id ?? '') as string,
+    );
+    const zkVerifierContractId = String(
+      (latest.zkVerifierContractId ?? latest.zk_verifier_id ?? '') as string,
+    );
+    const vkHash = String((latest.vkHash ?? latest.vk_hash ?? '') as string);
+    const gameHub = String((latest.gameHub ?? latest.game_hub ?? '') as string);
+
+    return {
+      network,
+      rpcUrl:
+        process.env.SOROBAN_RPC_URL ?? 'https://soroban-testnet.stellar.org',
+      heistContractId,
+      zkVerifierContractId,
+      vkHash,
+      gameHub:
+        gameHub ||
+        (process.env.GAME_HUB_CONTRACT_ID ??
+          'CB4VZAT2U3UC6XFK3N23SKRF2NDCMP3QHJYMCHHFMZO7MRQO6DQ2EMYG'),
+    };
+  }
+
   async onModuleInit(): Promise<void> {
     const network = process.env.STELLAR_NETWORK ?? 'testnet';
 
@@ -61,20 +92,15 @@ export class ConfigService implements OnModuleInit {
       const latest = await this.deploymentService.getLatest(network);
 
       if (latest) {
-        this.logger.log(
-          `Loaded deployment from Firestore [${network}]: ${latest.id}` +
-            ` — heist=${latest.heistContractId.slice(0, 8)}…`,
-        );
-        this.config = {
+        const normalized = this.fromDeployment(
           network,
-          rpcUrl:
-            process.env.SOROBAN_RPC_URL ??
-            'https://soroban-testnet.stellar.org',
-          heistContractId: latest.heistContractId,
-          zkVerifierContractId: latest.zkVerifierContractId,
-          vkHash: latest.vkHash,
-          gameHub: latest.gameHub,
-        };
+          latest as unknown as Record<string, unknown>,
+        );
+        this.logger.log(
+          `Loaded deployment from Firestore [${network}]: ${String((latest as { id?: string }).id ?? 'unknown')}` +
+            ` — heist=${normalized.heistContractId.slice(0, 8) || '(unset)'}…`,
+        );
+        this.config = normalized;
         return;
       }
 
@@ -82,8 +108,12 @@ export class ConfigService implements OnModuleInit {
         `No Firestore deployment found for network "${network}", falling back to env vars.`,
       );
     } catch (err) {
+      const details =
+        err instanceof Error
+          ? err.stack ?? err.message
+          : JSON.stringify(err);
       this.logger.warn(
-        `Firestore deployment read failed — falling back to env vars. Reason: ${err}`,
+        `Firestore deployment read failed — falling back to env vars. Reason: ${details}`,
       );
     }
 
