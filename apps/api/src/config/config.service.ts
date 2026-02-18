@@ -30,9 +30,29 @@ export interface AppConfig {
 @Injectable()
 export class ConfigService implements OnModuleInit {
   private readonly logger = new Logger(ConfigService.name);
-  private config!: AppConfig;
+  private config: AppConfig;
 
-  constructor(private readonly deploymentService: DeploymentService) {}
+  constructor(private readonly deploymentService: DeploymentService) {
+    // Initialize immediately with env fallback so dependent services can safely
+    // read config during their own onModuleInit lifecycle.
+    this.config = this.buildEnvFallback(
+      process.env.STELLAR_NETWORK ?? 'testnet',
+    );
+  }
+
+  private buildEnvFallback(network: string): AppConfig {
+    return {
+      network,
+      rpcUrl:
+        process.env.SOROBAN_RPC_URL ?? 'https://soroban-testnet.stellar.org',
+      heistContractId: process.env.HEIST_CONTRACT_ID ?? '',
+      zkVerifierContractId: process.env.ZK_VERIFIER_CONTRACT_ID ?? '',
+      vkHash: process.env.VK_HASH ?? '',
+      gameHub:
+        process.env.GAME_HUB_CONTRACT_ID ??
+        'CB4VZAT2U3UC6XFK3N23SKRF2NDCMP3QHJYMCHHFMZO7MRQO6DQ2EMYG',
+    };
+  }
 
   async onModuleInit(): Promise<void> {
     const network = process.env.STELLAR_NETWORK ?? 'testnet';
@@ -67,18 +87,8 @@ export class ConfigService implements OnModuleInit {
       );
     }
 
-    // Fallback: read directly from environment variables.
-    this.config = {
-      network,
-      rpcUrl:
-        process.env.SOROBAN_RPC_URL ?? 'https://soroban-testnet.stellar.org',
-      heistContractId: process.env.HEIST_CONTRACT_ID ?? '',
-      zkVerifierContractId: process.env.ZK_VERIFIER_CONTRACT_ID ?? '',
-      vkHash: process.env.VK_HASH ?? '',
-      gameHub:
-        process.env.GAME_HUB_CONTRACT_ID ??
-        'CB4VZAT2U3UC6XFK3N23SKRF2NDCMP3QHJYMCHHFMZO7MRQO6DQ2EMYG',
-    };
+    // Keep / refresh env fallback.
+    this.config = this.buildEnvFallback(network);
 
     this.logger.log(
       `Using env config [${network}]: heist=${this.config.heistContractId.slice(0, 8) || '(unset)'}…`,
