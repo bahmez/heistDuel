@@ -11,12 +11,16 @@ import { StellarModule } from './stellar/stellar.module';
   imports: [
     // Firebase Admin — global module, injected wherever needed
     FirebaseModule.forRoot({
-      projectId: process.env.FIREBASE_PROJECT_ID,
+      projectId:
+        process.env.FIREBASE_PROJECT_ID ||
+        process.env.GOOGLE_CLOUD_PROJECT ||
+        process.env.GCLOUD_PROJECT,
       serviceAccountPath: process.env.GOOGLE_APPLICATION_CREDENTIALS,
       useApplicationDefaultCredentials:
         process.env.FIREBASE_USE_ADC === 'true' ||
         !!process.env.K_SERVICE ||
-        !!process.env.GOOGLE_CLOUD_PROJECT,
+        !!process.env.GOOGLE_CLOUD_PROJECT ||
+        !!process.env.GCLOUD_PROJECT,
     }),
 
     // Stellar/Soroban RPC client — global module

@@ -33,6 +33,8 @@ export class FirebaseService implements OnModuleDestroy {
     }
 
     let credential: admin.credential.Credential;
+    let credentialMode: 'serviceAccountPath' | 'serviceAccountPathEnv' | 'clientEmailPrivateKey' | 'adc' =
+      'adc';
 
     // Cloud Run (and GCP in general) exposes Application Default Credentials.
     // We prefer explicit credentials when they are valid, but gracefully fall
@@ -46,6 +48,7 @@ export class FirebaseService implements OnModuleDestroy {
     if (options.serviceAccountPath) {
       try {
         credential = admin.credential.cert(options.serviceAccountPath);
+        credentialMode = 'serviceAccountPath';
       } catch (err) {
         if (!useAdcByDefault) {
           throw err;
@@ -55,12 +58,14 @@ export class FirebaseService implements OnModuleDestroy {
             `Falling back to Application Default Credentials (Cloud Run/GCP). Reason: ${err}`,
         );
         credential = admin.credential.applicationDefault();
+        credentialMode = 'adc';
       }
     } else if (options.serviceAccountPathEnv) {
       const path = process.env[options.serviceAccountPathEnv];
       if (path) {
         try {
           credential = admin.credential.cert(path);
+          credentialMode = 'serviceAccountPathEnv';
         } catch (err) {
           if (!useAdcByDefault) {
             throw err;
@@ -70,12 +75,14 @@ export class FirebaseService implements OnModuleDestroy {
               `Falling back to Application Default Credentials. Reason: ${err}`,
           );
           credential = admin.credential.applicationDefault();
+          credentialMode = 'adc';
         }
       } else if (useAdcByDefault) {
         this.logger.log(
           `Env "${options.serviceAccountPathEnv}" is not set — using Application Default Credentials.`,
         );
         credential = admin.credential.applicationDefault();
+        credentialMode = 'adc';
       } else {
         throw new Error(
           `Environment variable "${options.serviceAccountPathEnv}" is not set`,
@@ -87,8 +94,10 @@ export class FirebaseService implements OnModuleDestroy {
         clientEmail: options.clientEmail,
         privateKey: options.privateKey,
       });
+      credentialMode = 'clientEmailPrivateKey';
     } else if (useAdcByDefault) {
       credential = admin.credential.applicationDefault();
+      credentialMode = 'adc';
     } else {
       throw new Error(
         'FirebaseModule: no credentials provided. ' +
@@ -104,6 +113,14 @@ export class FirebaseService implements OnModuleDestroy {
     if (options.projectId) {
       appOptions.projectId = options.projectId;
     }
+
+    this.logger.log(
+      `Firebase credential mode: ${credentialMode}; ` +
+        `projectId option: ${options.projectId ?? '(unset)'}; ` +
+        `GOOGLE_CLOUD_PROJECT: ${process.env.GOOGLE_CLOUD_PROJECT ?? '(unset)'}; ` +
+        `GCLOUD_PROJECT: ${process.env.GCLOUD_PROJECT ?? '(unset)'}; ` +
+        `K_SERVICE: ${process.env.K_SERVICE ?? '(unset)'}`,
+    );
 
     return admin.initializeApp(appOptions, appName);
   }

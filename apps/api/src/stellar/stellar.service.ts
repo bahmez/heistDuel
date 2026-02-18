@@ -51,13 +51,6 @@ export class StellarService implements OnModuleInit {
     this.contractId = this.configService.get('heistContractId');
     this.verifierContractId = this.configService.get('zkVerifierContractId');
 
-    if (!this.contractId) {
-      throw new Error(
-        'Missing Heist contract ID at startup. ' +
-          'Ensure Firestore deployments has a latest record for this network, ' +
-          'or set HEIST_CONTRACT_ID in environment variables.',
-      );
-    }
     if (!this.rpcUrl) {
       throw new Error('Missing Soroban RPC URL at startup (rpcUrl).');
     }
@@ -79,9 +72,18 @@ export class StellarService implements OnModuleInit {
     }
 
     this.client = new HeistContractClient(this.contractId, this.rpcUrl);
+
+    if (!this.contractId) {
+      this.logger.error(
+        'Heist contract ID is empty at startup. ' +
+          'Gameplay endpoints will fail until config is fixed. ' +
+          'Check /api/config/public and ConfigService logs.',
+      );
+    }
+
     this.logger.log(
       `Stellar service ready — source: ${this.sourceKeypair.publicKey()} ` +
-        `contract: ${this.contractId.slice(0, 8)}…`,
+        `contract: ${this.contractId ? `${this.contractId.slice(0, 8)}…` : '(unset)'}`,
     );
   }
 

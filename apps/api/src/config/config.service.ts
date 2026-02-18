@@ -100,6 +100,12 @@ export class ConfigService implements OnModuleInit {
           `Loaded deployment from Firestore [${network}]: ${String((latest as { id?: string }).id ?? 'unknown')}` +
             ` — heist=${normalized.heistContractId.slice(0, 8) || '(unset)'}…`,
         );
+        this.logger.log(
+          `Effective config from Firestore [${network}] — ` +
+            `heist=${normalized.heistContractId || '(unset)'}, ` +
+            `verifier=${normalized.zkVerifierContractId || '(unset)'}, ` +
+            `rpc=${normalized.rpcUrl}`,
+        );
         this.config = normalized;
         return;
       }
@@ -122,6 +128,12 @@ export class ConfigService implements OnModuleInit {
 
     this.logger.log(
       `Using env config [${network}]: heist=${this.config.heistContractId.slice(0, 8) || '(unset)'}…`,
+    );
+    this.logger.log(
+      `Effective config from env [${network}] — ` +
+        `heist=${this.config.heistContractId || '(unset)'}, ` +
+        `verifier=${this.config.zkVerifierContractId || '(unset)'}, ` +
+        `rpc=${this.config.rpcUrl}`,
     );
   }
 
