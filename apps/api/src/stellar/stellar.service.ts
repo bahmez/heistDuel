@@ -41,19 +41,15 @@ export class StellarService implements OnModuleInit {
 
   private sourceKeypair!: Keypair;
   private client!: HeistContractClient;
+  private clientContractId = '';
 
   constructor(private readonly configService: ConfigService) {}
 
   onModuleInit(): void {
-    // ConfigService.onModuleInit() has already run at this point because
-    // StellarModule imports ConfigModule, establishing the dependency order.
-    this.rpcUrl = this.configService.get('rpcUrl');
-    this.contractId = this.configService.get('heistContractId');
-    this.verifierContractId = this.configService.get('zkVerifierContractId');
-
-    if (!this.rpcUrl) {
-      throw new Error('Missing Soroban RPC URL at startup (rpcUrl).');
-    }
+    // ConfigService can finish loading Firestore slightly later in the Nest
+    // lifecycle. We therefore avoid freezing contract IDs at startup and
+    // resolve them lazily in getClient()/signAndSubmit().
+    this.refreshRuntimeConfig();
 
     const secret = process.env.SOURCE_SECRET;
     const isCloudRun = !!process.env.K_SERVICE;
@@ -78,13 +74,9 @@ export class StellarService implements OnModuleInit {
       this.sourceKeypair = Keypair.fromSecret(secret);
     }
 
-    this.client = new HeistContractClient(this.contractId, this.rpcUrl);
-
     if (!this.contractId) {
-      this.logger.error(
-        'Heist contract ID is empty at startup. ' +
-          'Gameplay endpoints will fail until config is fixed. ' +
-          'Check /api/config/public and ConfigService logs.',
+      this.logger.warn(
+        'Heist contract ID is empty at startup. Waiting for ConfigService to load Firestore deployment...',
       );
     }
 
@@ -92,6 +84,13 @@ export class StellarService implements OnModuleInit {
       `Stellar service ready — source: ${this.sourceKeypair.publicKey()} ` +
         `contract: ${this.contractId ? `${this.contractId.slice(0, 8)}…` : '(unset)'}`,
     );
+  }
+
+  /** Refresh runtime config values from ConfigService (Firestore/env). */
+  private refreshRuntimeConfig(): void {
+    this.rpcUrl = this.configService.get('rpcUrl');
+    this.contractId = this.configService.get('heistContractId');
+    this.verifierContractId = this.configService.get('zkVerifierContractId');
   }
 
   getSourceKeypair(): Keypair {
@@ -103,14 +102,30 @@ export class StellarService implements OnModuleInit {
   }
 
   getClient(): HeistContractClient {
+    this.refreshRuntimeConfig();
+    if (!this.contractId) {
+      throw new Error(
+        'Heist contract ID is still empty. ' +
+          'Ensure ConfigService loaded Firestore deployment or HEIST_CONTRACT_ID is set.',
+      );
+    }
+    if (!this.client || this.clientContractId !== this.contractId) {
+      this.client = new HeistContractClient(this.contractId, this.rpcUrl);
+      this.clientContractId = this.contractId;
+      this.logger.log(
+        `Stellar client bound to contract ${this.contractId.slice(0, 8)}…`,
+      );
+    }
     return this.client;
   }
 
   getRpcUrl(): string {
+    this.refreshRuntimeConfig();
     return this.rpcUrl;
   }
 
   getVerifierContractId(): string {
+    this.refreshRuntimeConfig();
     return this.verifierContractId;
   }
 
@@ -123,6 +138,11 @@ export class StellarService implements OnModuleInit {
    * - Fall back to account-sequence heuristic if still NOT_FOUND after polling.
    */
   async signAndSubmit(txXdr: string, label = 'tx'): Promise<SubmitResult> {
+    this.refreshRuntimeConfig();
+    if (!this.rpcUrl) {
+      throw new Error('Missing Soroban RPC URL for signAndSubmit.');
+    }
+
     const kp = this.sourceKeypair;
     const server = new rpc.Server(this.rpcUrl);
 
