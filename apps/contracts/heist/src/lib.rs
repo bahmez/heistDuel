@@ -11,8 +11,8 @@ use soroban_sdk::xdr::ToXdr;
 use engine::{
     bit_is_set, bit_set, commit_hash, compute_state_hash, derive_session_seed, exists_any_path_len,
     from_arr18, generate_map, has_any_set_bit, is_full_collection, reveal_fog_4x4,
-    roll_value, to_arr18, zero_bitset, CAMERA_PENALTY, CELL_COUNT, GAME_SECONDS, LASER_PENALTY, MAP_H,
-    MAP_W,
+    roll_value, to_arr18, zero_bitset, BITSET_BYTES, CAMERA_PENALTY, CELL_COUNT, GAME_SECONDS,
+    LASER_PENALTY, MAP_H, MAP_W,
 };
 
 const GAME_TTL_LEDGERS: u32 = 518_400;
@@ -451,7 +451,9 @@ impl HeistContract {
             {
                 return Err(Error::InvalidNoPathFlag);
             }
-            if exists_any_path_len(&walls, &current_pos, rolled) {
+            // With partial-move rules, no_path_flag is valid only when even a
+            // single step is impossible (player is fully surrounded by walls).
+            if exists_any_path_len(&walls, &current_pos, 1) {
                 return Err(Error::InvalidNoPathFlag);
             }
         } else {
@@ -479,7 +481,7 @@ impl HeistContract {
         let loot_delta = if public_turn.no_path_flag {
             [0u8; 18]
         } else {
-            Self::collect_loot_delta_from_path(&game.loot, &game.loot_collected, &public_turn.path)?
+            Self::collect_loot_delta_from_path(&game.loot, &game.loot_collected, &public_turn.path)
         };
         let loot = to_arr18(&game.loot);
         let mut collected = to_arr18(&game.loot_collected);
@@ -667,12 +669,14 @@ impl HeistContract {
             i += 1;
         }
 
+        // A camera is visible when its influence area (radius) intersects the fog.
+        // This ensures that cameras just outside the revealed area are shown when
+        // their detection zone overlaps cells the player has already uncovered.
         let mut visible_cameras = Vec::new(&env);
         let mut ci = 0u32;
         while ci < game.cameras.len() {
             let cam = game.cameras.get(ci).unwrap();
-            let bit = cam.y * MAP_W + cam.x;
-            if bit_is_set(&fog, bit) {
+            if Self::camera_intersects_fog(&cam, &fog) {
                 visible_cameras.push_back(cam);
             }
             ci += 1;
@@ -730,6 +734,28 @@ impl HeistContract {
         Ok(compute_state_hash(&env, session_id, &game))
     }
 
+    /// Returns the deterministic dice value expected for the requested player at current turn index.
+    pub fn get_expected_roll(env: Env, session_id: u32, player: Address) -> Result<u32, Error> {
+        let game = Self::require_game(&env, session_id)?;
+        if game.status != GameStatus::Active {
+            return Err(Error::InvalidStatus);
+        }
+        let player_tag = if player == game.player1 {
+            1
+        } else if player == game.player2 {
+            2
+        } else {
+            return Err(Error::NotPlayer);
+        };
+        let session_seed = game.session_seed.ok_or(Error::SeedsNotReady)?;
+        Ok(roll_value(&env, session_seed, game.turn_index, player_tag))
+    }
+
+    /// Exposes the canonical public-turn hash used by proof verification.
+    pub fn hash_turn_public(env: Env, turn: TurnPublic) -> BytesN<32> {
+        Self::compute_turn_public_hash(&env, &turn)
+    }
+
     /// Simulates state transition hashing without touching chain state.
     pub fn simulate_state_hash_after(
         env: Env,
@@ -776,6 +802,37 @@ impl HeistContract {
 
         game.turn_index += 1;
         Ok(compute_state_hash(&env, session_id, &game))
+    }
+
+    /// Returns the loot-collected mask delta the contract would compute for a
+    /// given path.  Clients call this right before building a turn so the
+    /// submitted `loot_collected_mask_delta` always reflects the *current*
+    /// on-chain state — not a potentially-stale cached view.
+    /// Returns an error if any path cell already has its loot collected
+    /// (mirrors the same check in `submit_turn`).
+    pub fn get_path_loot_delta(
+        env: Env,
+        session_id: u32,
+        path: Vec<Position>,
+    ) -> Result<BytesN<18>, Error> {
+        let game = Self::require_game(&env, session_id)?;
+        let delta =
+            Self::collect_loot_delta_from_path(&game.loot, &game.loot_collected, &path);
+        Ok(from_arr18(&env, &delta))
+    }
+
+    /// Returns the (camera_hits, laser_hits) the contract would compute for a
+    /// given path. Callable by anyone — clients use this to build valid turns
+    /// without needing full game-state access (fog-of-war limitation).
+    pub fn get_path_hazards(
+        env: Env,
+        session_id: u32,
+        path: Vec<Position>,
+    ) -> Result<(u32, u32), Error> {
+        let game = Self::require_game(&env, session_id)?;
+        let (cam_hits, laser_hits) =
+            Self::compute_hazard_hits(&path, &game.cameras, &game.lasers);
+        Ok((cam_hits, laser_hits))
     }
 
     pub fn get_admin(env: Env) -> Address {
@@ -860,7 +917,9 @@ impl HeistContract {
     }
 
     fn validate_path(walls: &[u8; 18], path: &Vec<Position>, rolled: u32) -> bool {
-        if path.len() != rolled + 1 {
+        // Partial-move rule: the player may stop anywhere after 1..=rolled steps.
+        // path includes the start position, so valid length is 2..=rolled+1.
+        if path.len() < 2 || path.len() > rolled + 1 {
             return false;
         }
         let mut i = 0u32;
@@ -889,7 +948,7 @@ impl HeistContract {
         loot: &BytesN<18>,
         loot_collected: &BytesN<18>,
         path: &Vec<Position>,
-    ) -> Result<[u8; 18], Error> {
+    ) -> [u8; 18] {
         let loot_arr = to_arr18(loot);
         let collected_arr = to_arr18(loot_collected);
         let mut delta = [0u8; 18];
@@ -898,15 +957,15 @@ impl HeistContract {
         while i < path.len() {
             let p = path.get(i).unwrap();
             let bit = p.y * MAP_W + p.x;
-            if bit_is_set(&loot_arr, bit) {
-                if bit_is_set(&collected_arr, bit) {
-                    return Err(Error::LootAlreadyCollected);
-                }
+            // A cell whose loot is already collected can still be traversed —
+            // just skip it (no delta entry).  The error is only raised below
+            // when the *submitted* delta explicitly claims already-taken loot.
+            if bit_is_set(&loot_arr, bit) && !bit_is_set(&collected_arr, bit) {
                 bit_set(&mut delta, bit);
             }
             i += 1;
         }
-        Ok(delta)
+        delta
     }
 
     fn compute_hazard_hits(path: &Vec<Position>, cameras: &Vec<Camera>, lasers: &Vec<Laser>) -> (u32, u32) {
@@ -959,6 +1018,32 @@ impl HeistContract {
                 return true;
             }
             i += 1;
+        }
+        false
+    }
+
+    /// Returns true when any cell within the camera's manhattan-distance radius
+    /// is inside the player fog. Used to reveal cameras whose detection zone
+    /// overlaps the fog even though their origin cell is outside it.
+    fn camera_intersects_fog(camera: &Camera, fog: &[u8; BITSET_BYTES]) -> bool {
+        let cx = camera.x as i32;
+        let cy = camera.y as i32;
+        let r = camera.radius as i32;
+        let mut di = -r;
+        while di <= r {
+            let rem = r - if di < 0 { -di } else { di };
+            let mut dj = -rem;
+            while dj <= rem {
+                let nx = cx + di;
+                let ny = cy + dj;
+                if nx >= 0 && ny >= 0 && (nx as u32) < MAP_W && (ny as u32) < MAP_H {
+                    if bit_is_set(fog, (ny as u32) * MAP_W + (nx as u32)) {
+                        return true;
+                    }
+                }
+                dj += 1;
+            }
+            di += 1;
         }
         false
     }

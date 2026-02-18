@@ -1,24 +1,30 @@
 {
-  "deployed_at_utc": "2026-02-16T19:36:39Z",
+  "deployed_at_utc": "2026-02-17T23:39:12Z",
   "network": "testnet",
   "deployer_alias": "heist-testnet-deployer",
   "deployer_address": "GCVGPJ2YUTJNOMP3WBKNUNG5WK7B5EFYZUOV7KZQ4QEGL75HLSKFC6EC",
   "game_hub_id": "CB4VZAT2U3UC6XFK3N23SKRF2NDCMP3QHJYMCHHFMZO7MRQO6DQ2EMYG",
   "contracts": {
     "zk_verifier": {
-      "contract_id": "CA7V4TRELT3JXMN2C2IVJFFZNPXAFN7KLGLKCHKNDSRAWHIBCZCDBDLJ",
+      "contract_id": "CAMIBXPSJZFDXPV27B3NCGEBLSMJPOPCD3XBH2BJR2QPZ3UX6FAWYRGH",
       "wasm_hash": "16f8d0e82deff17274c9fdf3722fce9667c8f4d8242154963e80d69685846290",
-      "deploy_tx_hash": "78c2d85a72ae35b3fa084ed8eab44fd43b83fc4c8095b5c252e52cc44a8a0ca9"
+      "vk_hash": "561dfaa396ff7feebc12fbf35668abe302bf88809f2f6918065dbe4f073de0ce"
     },
     "heist": {
-      "contract_id": "CDG5LXIM2EAIAEEPVZUE46SNIXOWXRW3PIAJJ3GQA4GEXX7HLO7K3YAG",
-      "wasm_hash": "2d46da1a710727ae6ea6a6c258952175fba21733fe54a077e53e1ee543d883f2",
-      "deploy_tx_hash": "f44e8688662d5b9b630cbda72c1678003a8585f0263a54b9b3fcc05d20cb893e",
+      "contract_id": "CDYFF6FEVJZ76WCRPHYLA6YYOQV2S64AJIZ334JEDVOM5ZFZ22ADRFRR",
+      "wasm_hash": "de81a9b710a12ec10ecceda29054575f96bc74d215e85ea0b2d3391298fb89c2",
       "constructor": {
         "admin": "GCVGPJ2YUTJNOMP3WBKNUNG5WK7B5EFYZUOV7KZQ4QEGL75HLSKFC6EC",
         "game_hub": "CB4VZAT2U3UC6XFK3N23SKRF2NDCMP3QHJYMCHHFMZO7MRQO6DQ2EMYG",
-        "verifier": "CA7V4TRELT3JXMN2C2IVJFFZNPXAFN7KLGLKCHKNDSRAWHIBCZCDBDLJ"
-      }
+        "verifier": "CAMIBXPSJZFDXPV27B3NCGEBLSMJPOPCD3XBH2BJR2QPZ3UX6FAWYRGH"
+      },
+      "changes": [
+        "partial-move rule: players may stop after 1..N steps instead of exactly N",
+        "fog reveal: symmetric 5x5 centered window — both players now see the same area",
+        "camera visibility: revealed when influence radius overlaps fog (not just position)",
+        "new function: get_path_hazards(session_id, path) -> (camera_hits, laser_hits)",
+        "new function: get_path_loot_delta(session_id, path) -> loot_mask — avoids stale loot state"
+      ]
     }
   }
 }

@@ -1,0 +1,18 @@
+{
+  "name": "@repo/stellar",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@stellar/stellar-sdk": "^14.5.0",
+    "js-sha3": "^0.9.3"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3"
+  }
+}

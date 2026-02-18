@@ -60,6 +60,12 @@ Fonctions principales:
   - Verifie hash d'etat avant/apres.
   - Verifie deplacement (`path`) et contraintes anti-triche (loot/hazards recalcules).
   - Verifie preuve via `zk-verifier` avec hash des inputs publics.
+- `get_expected_roll(session_id, player)`
+  - Retourne le roll attendu pour le joueur au tour courant.
+- `hash_turn_public(turn_public)`
+  - Expose le hash exact des inputs publics utilises par la verification.
+- `simulate_state_hash_after(session_id, public_turn)`
+  - Simule le hash d'etat apres application d'un tour (read-only).
 - `end_if_finished(session_id)`
   - Termine sur timeout ou loot complet.
 - `get_player_view(session_id, player)`
@@ -103,3 +109,21 @@ Le script:
 - deploie `heist` avec l'id du verifier deploye
 - ecrit un fichier de sortie:
   - `apps/contracts/deployments/<network>.json`
+
+## Upgrade d'un contrat heist deja deploye
+
+Exemple testnet (admin requis):
+
+```powershell
+stellar contract install `
+  --network testnet `
+  --source-account heist-testnet-deployer `
+  --wasm target/wasm32v1-none/release/heist.wasm
+
+stellar contract invoke `
+  --network testnet `
+  --source-account heist-testnet-deployer `
+  --id CDG5LXIM2EAIAEEPVZUE46SNIXOWXRW3PIAJJ3GQA4GEXX7HLO7K3YAG `
+  -- upgrade `
+  --new_wasm_hash <WASM_HASH_HEX>
+```

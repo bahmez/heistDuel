@@ -103,22 +103,24 @@ fn has_any_path(walls: &[u8; BITSET_BYTES], x: i32, y: i32, steps: u32) -> bool 
         || has_any_path(walls, x, y - 1, steps - 1)
 }
 
+/// Reveal a symmetric 5×5 area centered on (cx, cy), clamped to grid bounds.
+/// Using cx±2 instead of the old cx-1 + 4 ensures both players see the same
+/// number of cells regardless of their spawn corner.
 pub fn reveal_fog_4x4(fog: &mut [u8; BITSET_BYTES], cx: u32, cy: u32) {
-    let start_x = if cx > 0 { cx - 1 } else { 0 };
-    let start_y = if cy > 0 { cy - 1 } else { 0 };
+    let start_x = if cx >= 2 { cx - 2 } else { 0 };
+    let start_y = if cy >= 2 { cy - 2 } else { 0 };
+    // +2 end, clamped to MAP_W/H - 1
+    let end_x = if cx + 2 < MAP_W { cx + 2 } else { MAP_W - 1 };
+    let end_y = if cy + 2 < MAP_H { cy + 2 } else { MAP_H - 1 };
 
-    let mut dx = 0u32;
-    while dx < 4 {
-        let mut dy = 0u32;
-        while dy < 4 {
-            let x = start_x + dx;
-            let y = start_y + dy;
-            if x < MAP_W && y < MAP_H {
-                bit_set(fog, idx(x, y));
-            }
-            dy += 1;
+    let mut x = start_x;
+    while x <= end_x {
+        let mut y = start_y;
+        while y <= end_y {
+            bit_set(fog, idx(x, y));
+            y += 1;
         }
-        dx += 1;
+        x += 1;
     }
 }
 

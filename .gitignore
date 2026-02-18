@@ -5,6 +5,7 @@ dist
 coverage
 .env
 .env.*
+!.env.example
 
 # Soroban/Rust contract artifacts
 target/
@@ -12,3 +13,5 @@ test_snapshots/
 .stellar/
 .soroban/
 Cargo.lock
+
+service-account.json

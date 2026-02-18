@@ -1,0 +1,53 @@
+@import "tailwindcss";
+
+@theme {
+  --color-heist-dark: #0a0e17;
+  --color-heist-darker: #060a10;
+  --color-heist-card: #111827;
+  --color-heist-border: #1e293b;
+  --color-heist-green: #10b981;
+  --color-heist-green-glow: #34d399;
+  --color-heist-red: #ef4444;
+  --color-heist-gold: #f59e0b;
+  --color-heist-blue: #3b82f6;
+  --color-heist-purple: #8b5cf6;
+
+  --color-wall: #374151;
+  --color-loot: #fbbf24;
+  --color-camera: #f87171;
+  --color-laser: #ef4444;
+  --color-fog: #0f172a;
+  --color-revealed: #1e293b;
+  --color-player1: #10b981;
+  --color-player2: #3b82f6;
+  --color-path-highlight: #a78bfa;
+}
+
+body {
+  background-color: var(--color-heist-dark);
+  color: #e2e8f0;
+  font-family: "Inter", ui-sans-serif, system-ui, -apple-system, sans-serif;
+}
+
+/* Glow effects */
+.glow-green {
+  box-shadow: 0 0 12px rgba(16, 185, 129, 0.4);
+}
+.glow-blue {
+  box-shadow: 0 0 12px rgba(59, 130, 246, 0.4);
+}
+.glow-gold {
+  box-shadow: 0 0 8px rgba(251, 191, 36, 0.5);
+}
+.glow-red {
+  box-shadow: 0 0 10px rgba(239, 68, 68, 0.4);
+}
+
+/* Pulse animation for active player */
+@keyframes pulse-border {
+  0%, 100% { border-color: rgba(16, 185, 129, 0.4); }
+  50% { border-color: rgba(16, 185, 129, 1); }
+}
+.animate-pulse-border {
+  animation: pulse-border 2s ease-in-out infinite;
+}
