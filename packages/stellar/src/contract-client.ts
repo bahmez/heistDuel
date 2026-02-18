@@ -340,7 +340,7 @@ export class HeistContractClient {
       fee: "100",
       networkPassphrase: NETWORK_PASSPHRASE,
     })
-      .addOperation(this.contract.call(method, ...args))
+      .addOperation(this.ensureContract().call(method, ...args))
       .setTimeout(30)
       .build();
 
@@ -522,7 +522,7 @@ export class HeistContractClient {
       networkPassphrase: NETWORK_PASSPHRASE,
     })
       .addOperation(
-        this.contract.call(
+        this.ensureContract().call(
           "start_game",
           u32Val(sessionId),
           addressVal(player1),
@@ -560,7 +560,7 @@ export class HeistContractClient {
       networkPassphrase: NETWORK_PASSPHRASE,
     })
       .addOperation(
-        this.contract.call(
+        this.ensureContract().call(
           "reveal_seed",
           u32Val(sessionId),
           addressVal(player),
@@ -588,7 +588,7 @@ export class HeistContractClient {
       fee: "10000000",
       networkPassphrase: NETWORK_PASSPHRASE,
     })
-      .addOperation(this.contract.call("begin_match", u32Val(sessionId)))
+      .addOperation(this.ensureContract().call("begin_match", u32Val(sessionId)))
       .setTimeout(300)
       .build();
 
@@ -614,7 +614,7 @@ export class HeistContractClient {
       networkPassphrase: NETWORK_PASSPHRASE,
     })
       .addOperation(
-        this.contract.call(
+        this.ensureContract().call(
           "submit_turn",
           u32Val(sessionId),
           addressVal(player),
