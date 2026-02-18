@@ -14,6 +14,32 @@ export class DeploymentStore {
     return this.firebase.getFirestore();
   }
 
+  /** Coerce an untyped Firestore row into a DeploymentRecord shape. */
+  private asDeploymentRecord(row: Record<string, unknown>): DeploymentRecord {
+    const modeRaw = String((row.mode ?? 'full') as string).toLowerCase();
+    return {
+      id: String((row.id ?? row.deployedAt ?? '') as string),
+      network: String((row.network ?? '') as string),
+      deployedAt: String((row.deployedAt ?? row.id ?? '') as string),
+      source: String((row.source ?? '') as string),
+      admin: String((row.admin ?? '') as string),
+      gameHub: String((row.gameHub ?? row.game_hub ?? '') as string),
+      heistContractId: String(
+        (row.heistContractId ?? row.heist_id ?? '') as string,
+      ),
+      zkVerifierContractId: String(
+        (row.zkVerifierContractId ?? row.zk_verifier_id ?? '') as string,
+      ),
+      vkHash: String((row.vkHash ?? row.vk_hash ?? '') as string),
+      wasmHash: row.wasmHash
+        ? String(row.wasmHash as string)
+        : row.wasm_hash
+          ? String(row.wasm_hash as string)
+          : undefined,
+      mode: modeRaw === 'upgrade' ? 'upgrade' : 'full',
+    };
+  }
+
   /** Persist a new deployment record. The document ID is record.id. */
   async save(record: DeploymentRecord): Promise<void> {
     await this.db.collection(COLLECTION).doc(record.id).set(record);
@@ -66,10 +92,10 @@ export class DeploymentStore {
       return n === wanted;
     });
 
-    if (byNetwork) return byNetwork as DeploymentRecord;
+    if (byNetwork) return this.asDeploymentRecord(byNetwork);
 
     // Last resort: return the most recent deployment regardless of network.
-    if (ranked.length > 0) return ranked[0] as DeploymentRecord;
+    if (ranked.length > 0) return this.asDeploymentRecord(ranked[0]!);
 
     // If we had an indexed-query failure and no fallback data, bubble up with
     // full error context so Cloud Run logs expose the Firestore index URL.
@@ -98,7 +124,8 @@ export class DeploymentStore {
           String((b.deployedAt ?? b.id ?? '') as string).localeCompare(
             String((a.deployedAt ?? a.id ?? '') as string),
           ),
-        ) as DeploymentRecord[];
+        )
+        .map((r) => this.asDeploymentRecord(r));
     }
   }
 }
