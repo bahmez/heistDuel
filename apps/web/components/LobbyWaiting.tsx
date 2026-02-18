@@ -18,10 +18,14 @@ export function LobbyWaiting({
   phase,
 }: LobbyWaitingProps) {
   const [copied, setCopied] = useState(false);
+  const appUrlFromEnv = process.env.NEXT_PUBLIC_APP_URL?.trim() ?? "";
+  const appBaseUrl = appUrlFromEnv.replace(/\/+$/, "");
   const joinUrl =
-    typeof window !== "undefined"
-      ? `${window.location.origin}/game/${gameId}`
-      : `/game/${gameId}`;
+    appBaseUrl
+      ? `${appBaseUrl}/game/${gameId}`
+      : typeof window !== "undefined"
+        ? `${window.location.origin}/game/${gameId}`
+        : `/game/${gameId}`;
 
   const copyLink = () => {
     navigator.clipboard.writeText(joinUrl);
