@@ -2,20 +2,32 @@
   "name": "@repo/firebase",
   "version": "0.0.1",
   "private": true,
-  "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    }
+  },
   "scripts": {
-    "build": "echo \"firebase: no build step\"",
-    "dev": "echo \"firebase: no dev step\"",
+    "build": "tsup src/index.ts --format cjs,esm --dts --clean",
+    "dev": "tsup src/index.ts --format cjs,esm --dts --watch",
     "typecheck": "tsc --noEmit",
     "lint": "echo \"firebase: no lint step\"",
     "test": "echo \"firebase: no test step\""
   },
   "dependencies": {
-    "@repo/shared": "workspace:*"
+    "@nestjs/common": "^11.0.1",
+    "firebase-admin": "^12.7.0",
+    "reflect-metadata": "^0.2.2"
   },
   "devDependencies": {
+    "tsup": "^8.3.5",
     "typescript": "^5.7.3"
+  },
+  "peerDependencies": {
+    "@nestjs/core": "^11.0.1"
   }
 }

@@ -1,161 +1,120 @@
 "use client";
 
-import { useState, useEffect, useCallback, useRef } from "react";
-import { useWallet } from "./wallet-context";
-import { useSocket } from "./socket-context";
-import {
-  HeistContractClient,
-  type PlayerGameView,
-} from "@repo/stellar";
+import { useEffect, useRef, useCallback } from "react";
+import { useGameStore } from "../stores/game-store";
+import { useLobbyStore } from "../stores/lobby-store";
 
-const RPC_URL =
-  process.env.NEXT_PUBLIC_SOROBAN_RPC_URL ||
-  "https://soroban-testnet.stellar.org";
-const HEIST_CONTRACT =
-  process.env.NEXT_PUBLIC_HEIST_CONTRACT_ID || "";
-const ZK_VERIFIER_CONTRACT =
-  process.env.NEXT_PUBLIC_ZK_VERIFIER_CONTRACT_ID || "";
+const GAME_POLL_INTERVAL_MS = 5_000;
 
-export interface GameState {
-  view: PlayerGameView | null;
-  roll: number | null;
-  stateHash: Uint8Array | null;
-  loading: boolean;
-  error: string | null;
-  lobbyPhase: string | null;
-  sessionId: number | null;
-}
+/**
+ * Game state hook — wires together the SSE lobby stream, auth-entry signing,
+ * and on-chain game state polling.
+ *
+ * Responsibilities:
+ *  1. Open an SSE connection to GET /api/lobby/:gameId/events on mount.
+ *     The stream delivers real-time lobby state + pending auth requests —
+ *     no polling required for either.
+ *  2. Auto-sign pending auth-entry requests when they appear in the SSE stream.
+ *  3. Poll on-chain game state every 5 s once the lobby is active.
+ */
+export function useGame(
+  gameId: string,
+  playerAddress: string | undefined,
+  signAuthEntry: ((preimageXdr: string) => Promise<string>) | undefined,
+) {
+  const {
+    lobby,
+    pendingAuth,
+    connectSSE,
+    disconnectSSE,
+    submitAuthResponse,
+  } = useLobbyStore();
 
-export function useGame(gameId: string) {
-  const { address } = useWallet();
-  const { socket } = useSocket();
-  const [state, setState] = useState<GameState>({
-    view: null,
-    roll: null,
-    stateHash: null,
-    loading: false,
-    error: null,
-    lobbyPhase: null,
-    sessionId: null,
-  });
-  const clientRef = useRef<HeistContractClient | null>(null);
+  const { view, roll, stateHash, vkHash, loading, error, fetchGameState, fetchVkHash } =
+    useGameStore();
 
-  // Always holds the latest refreshGameState — avoids stale closures in
-  // socket event handlers whose deps don't include refreshGameState.
-  const refreshRef = useRef<() => Promise<void>>(async () => {});
+  // Track which auth requests we've already submitted to avoid double-signing
+  const submittedAuthKeys = useRef<Set<string>>(new Set());
+
+  // ─── SSE connection ─────────────────────────────────────────────────────────
 
   useEffect(() => {
-    clientRef.current = new HeistContractClient(HEIST_CONTRACT, RPC_URL);
-  }, []);
+    if (!gameId) return;
+    connectSSE(gameId);
+    return () => disconnectSSE();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [gameId]);
+
+  // ─── Auto-sign pending auth entries ─────────────────────────────────────────
+
+  useEffect(() => {
+    if (!pendingAuth || !playerAddress || !signAuthEntry) return;
+    if (pendingAuth.playerAddress !== playerAddress) return;
+
+    // Deduplicate: only sign each request once (purpose + timestamp = unique key)
+    const key = `${pendingAuth.purpose}:${pendingAuth.requestedAt}`;
+    if (submittedAuthKeys.current.has(key)) return;
+    submittedAuthKeys.current.add(key);
+
+    void (async () => {
+      try {
+        console.log(`[auth] Signing entry for: ${pendingAuth.purpose}`);
+        const signatureBase64 = await signAuthEntry(pendingAuth.preimageXdr);
+        const ok = await submitAuthResponse(
+          gameId,
+          pendingAuth.purpose,
+          playerAddress,
+          signatureBase64,
+        );
+        if (!ok) {
+          console.error("[auth] submitAuthResponse returned false");
+          submittedAuthKeys.current.delete(key);
+        }
+      } catch (err) {
+        console.error("[auth] Failed to sign auth entry:", err);
+        // Remove from submitted set so the user can retry on the next SSE event
+        submittedAuthKeys.current.delete(key);
+      }
+    })();
+  }, [pendingAuth, playerAddress, signAuthEntry, gameId, submitAuthResponse]);
+
+  // ─── Game state polling (active phase) ─────────────────────────────────────
+
+  const sessionId = lobby?.sessionId;
 
   const refreshGameState = useCallback(async () => {
-    if (!address || !clientRef.current) return;
+    if (!playerAddress || !sessionId) return;
+    await fetchGameState(playerAddress, sessionId);
+  }, [playerAddress, sessionId, fetchGameState]);
 
-    // Read the latest sessionId directly from the ref so we never operate on
-    // a stale closure value captured at callback-creation time.
-    setState((s) => {
-      if (!s.sessionId) return s; // nothing to do yet
-      return { ...s, loading: true, error: null };
-    });
+  useEffect(() => {
+    if (lobby?.phase !== "active" || !playerAddress || !sessionId) return;
 
-    // We need the current sessionId; pull it from state via an intermediate
-    // approach — schedule the async work after the state read.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const sessionId: number | null = (clientRef as any)._sessionId ?? null;
-    if (!sessionId) return;
+    // Fetch immediately when phase transitions to active
+    void refreshGameState();
 
-    try {
-      const client = clientRef.current;
-      const [view, roll, stateHash] = await Promise.all([
-        client.getPlayerView(address, sessionId, address),
-        client.getExpectedRoll(address, sessionId, address).catch(() => null),
-        client.getStateHash(address, sessionId).catch(() => null),
-      ]);
+    // Keep polling to pick up opponent turns and game-over status
+    const id = setInterval(() => void refreshGameState(), GAME_POLL_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, [lobby?.phase, playerAddress, sessionId, refreshGameState]);
 
-      const isEnded = view.status === "Ended";
-      setState((s) => ({
-        ...s,
-        view,
-        // roll is irrelevant once the game is over
-        roll: isEnded ? null : roll,
-        stateHash: isEnded ? null : stateHash,
-        loading: false,
-        error: null,
-        lobbyPhase: isEnded ? "ended" : "active",
-      }));
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      setState((s) => ({ ...s, error: msg, loading: false }));
+  // ─── VK hash fetch ──────────────────────────────────────────────────────────
+
+  useEffect(() => {
+    if (playerAddress) {
+      void fetchVkHash(playerAddress);
     }
-  }, [address]);
+  }, [playerAddress, fetchVkHash]);
 
-  // Keep a stable ref so socket handlers always call the current version
-  useEffect(() => {
-    refreshRef.current = refreshGameState;
-  }, [refreshGameState]);
-
-  // Mirror sessionId into a ref on clientRef so refreshGameState can read it
-  // without depending on state (which would create stale closures).
-  const sessionIdRef = useRef<number | null>(null);
-  useEffect(() => {
-    sessionIdRef.current = state.sessionId;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (clientRef as any)._sessionId = state.sessionId;
-  }, [state.sessionId]);
-
-  useEffect(() => {
-    if (!socket || !gameId) return;
-    socket.emit("join_lobby", gameId);
-
-    const onLobbyState = (lobby: { phase: string; sessionId: number }) => {
-      setState((s) => ({
-        ...s,
-        lobbyPhase: lobby.phase,
-        sessionId: lobby.sessionId,
-      }));
-    };
-
-    // Use refreshRef so we always call the latest version regardless of when
-    // the effect was created.
-    const onGameStarted = () => { void refreshRef.current(); };
-    const onOpponentTurn = () => { void refreshRef.current(); };
-    const onGameEnded = () => { void refreshRef.current(); };
-    const onError = (data: { message: string }) => {
-      setState((s) => ({ ...s, error: data.message }));
-    };
-
-    socket.on("lobby_state", onLobbyState);
-    socket.on("game_started", onGameStarted);
-    socket.on("opponent_turn", onOpponentTurn);
-    socket.on("game_ended", onGameEnded);
-    socket.on("error", onError);
-
-    return () => {
-      socket.off("lobby_state", onLobbyState);
-      socket.off("game_started", onGameStarted);
-      socket.off("opponent_turn", onOpponentTurn);
-      socket.off("game_ended", onGameEnded);
-      socket.off("error", onError);
-    };
-  }, [socket, gameId]);
-
-  // When the lobby becomes active, start polling until we get the game view.
-  // This handles RPC lag after begin_match (state may not be visible yet).
-  useEffect(() => {
-    if (state.lobbyPhase !== "active" || !address || !state.sessionId || state.view) return;
-
-    // Try immediately
-    void refreshRef.current();
-
-    // Keep retrying every 5 s in case the RPC node is still catching up
-    const interval = setInterval(() => {
-      void refreshRef.current();
-    }, 5_000);
-
-    return () => clearInterval(interval);
-    // Intentionally omit refreshRef from deps — it's a stable ref.
-    // Re-run only when the key conditions change.
-  }, [state.lobbyPhase, address, state.sessionId, state.view]);
-
-  return { ...state, refreshGameState };
+  return {
+    view,
+    roll,
+    stateHash,
+    vkHash,
+    loading,
+    error,
+    lobbyPhase: lobby?.phase ?? null,
+    sessionId: lobby?.sessionId ?? null,
+    refreshGameState,
+  };
 }

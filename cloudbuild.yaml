@@ -3,7 +3,21 @@ substitutions:
   _WEB_SERVICE: "web"
   _BRANCH: "main"
   _REGION: "europe-west1"
+  # Frontend runtime/backend URL (required by web app at runtime)
   _NEXT_PUBLIC_API_URL: ""
+  # Backend required config
+  _API_FIREBASE_PROJECT_ID: ""
+  _API_STELLAR_NETWORK: "testnet"
+  _API_SOROBAN_RPC_URL: "https://soroban-testnet.stellar.org"
+  _API_CORS_ORIGIN: "*"
+  # Optional backend flags
+  _API_FIREBASE_USE_ADC: "true"
+  _API_HEIST_CONTRACT_ID: ""
+  _API_ZK_VERIFIER_CONTRACT_ID: ""
+  _API_GAME_HUB_CONTRACT_ID: "CB4VZAT2U3UC6XFK3N23SKRF2NDCMP3QHJYMCHHFMZO7MRQO6DQ2EMYG"
+  _API_VK_HASH: ""
+  # Backend source secret (temporary plain env var; move to Secret Manager later)
+  _API_SOURCE_SECRET: ""
 
 options:
   logging: CLOUD_LOGGING_ONLY
@@ -33,7 +47,7 @@ steps:
       - "--region=${_REGION}"
       - "--platform=managed"
       - "--allow-unauthenticated"
-      - "--set-env-vars=NODE_ENV=production"
+      - "--set-env-vars=NODE_ENV=production,PORT=8080,FIREBASE_PROJECT_ID=${_API_FIREBASE_PROJECT_ID},FIREBASE_USE_ADC=${_API_FIREBASE_USE_ADC},STELLAR_NETWORK=${_API_STELLAR_NETWORK},SOROBAN_RPC_URL=${_API_SOROBAN_RPC_URL},CORS_ORIGIN=${_API_CORS_ORIGIN},HEIST_CONTRACT_ID=${_API_HEIST_CONTRACT_ID},ZK_VERIFIER_CONTRACT_ID=${_API_ZK_VERIFIER_CONTRACT_ID},GAME_HUB_CONTRACT_ID=${_API_GAME_HUB_CONTRACT_ID},VK_HASH=${_API_VK_HASH},SOURCE_SECRET=${_API_SOURCE_SECRET}"
 
   # Web build and deploy
   - name: "gcr.io/cloud-builders/docker"
@@ -61,7 +75,7 @@ steps:
       - "--region=${_REGION}"
       - "--platform=managed"
       - "--allow-unauthenticated"
-      - "--set-env-vars=NODE_ENV=production,NEXT_PUBLIC_API_URL=${_NEXT_PUBLIC_API_URL}"
+      - "--set-env-vars=NODE_ENV=production,PORT=8080,NEXT_PUBLIC_API_URL=${_NEXT_PUBLIC_API_URL}"
 
 images:
   - "gcr.io/$PROJECT_ID/${_API_SERVICE}-${_BRANCH}:$SHORT_SHA"

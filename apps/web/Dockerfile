@@ -1,24 +1,27 @@
-FROM node:20-alpine AS build
+FROM node:20-bookworm-slim AS base
 WORKDIR /workspace
 RUN corepack enable
 
-ARG NEXT_PUBLIC_API_URL
-ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
-
-COPY package.json pnpm-workspace.yaml tsconfig.base.json ./
+FROM base AS deps
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json turbo.json ./
 COPY apps/web/package.json apps/web/
 COPY packages/ui/package.json packages/ui/
 COPY packages/shared/package.json packages/shared/
+COPY packages/stellar/package.json packages/stellar/
+RUN pnpm install --frozen-lockfile
 
-RUN pnpm install --filter web...
+FROM deps AS build
+ARG NEXT_PUBLIC_API_URL
+ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
 
 COPY apps/web apps/web
 COPY packages/ui packages/ui
 COPY packages/shared packages/shared
+COPY packages/stellar packages/stellar
 
 RUN pnpm --filter web... build
 
-FROM node:20-alpine AS runtime
+FROM node:20-bookworm-slim AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=8080

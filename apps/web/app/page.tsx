@@ -4,9 +4,8 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { WalletButton } from "../components/WalletButton";
 import { useWallet } from "../lib/wallet-context";
+import { useLobbyStore } from "../stores/lobby-store";
 import { generateRandomSeed, commitHash } from "@repo/stellar";
-
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001";
 
 function bytesToHex(bytes: Uint8Array): string {
   return Array.from(bytes)
@@ -17,74 +16,48 @@ function bytesToHex(bytes: Uint8Array): string {
 export default function HomePage() {
   const router = useRouter();
   const { address, connected } = useWallet();
+  const { createLobby, joinLobby, loading, error, clearError } = useLobbyStore();
   const [joinCode, setJoinCode] = useState("");
-  const [creating, setCreating] = useState(false);
-  const [joining, setJoining] = useState(false);
-  const [error, setError] = useState<string | null>(null);
 
   const handleCreateGame = async () => {
     if (!address) return;
-    setCreating(true);
-    setError(null);
+    clearError();
 
     try {
       const seedSecret = generateRandomSeed();
       const seedCommit = commitHash(seedSecret);
 
-      const res = await fetch(`${API_URL}/api/lobby`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          playerAddress: address,
-          seedCommit: bytesToHex(seedCommit),
-          seedSecret: bytesToHex(seedSecret),
-        }),
-      });
+      const gameId = await createLobby(
+        address,
+        bytesToHex(seedCommit),
+        bytesToHex(seedSecret),
+      );
 
-      if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.error || "Failed to create game");
-      }
-
-      const data = await res.json();
-      router.push(`/game/${data.gameId}`);
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to create game");
-    } finally {
-      setCreating(false);
+      router.push(`/game/${gameId}`);
+    } catch {
+      // Error already stored in the lobby store
     }
   };
 
   const handleJoinGame = async () => {
     if (!address || !joinCode.trim()) return;
-    setJoining(true);
-    setError(null);
+    clearError();
 
     try {
       const seedSecret = generateRandomSeed();
       const seedCommit = commitHash(seedSecret);
-
       const gameId = joinCode.trim();
-      const res = await fetch(`${API_URL}/api/lobby/${gameId}/join`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          playerAddress: address,
-          seedCommit: bytesToHex(seedCommit),
-          seedSecret: bytesToHex(seedSecret),
-        }),
-      });
 
-      if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.error || "Failed to join game");
-      }
+      await joinLobby(
+        gameId,
+        address,
+        bytesToHex(seedCommit),
+        bytesToHex(seedSecret),
+      );
 
       router.push(`/game/${gameId}`);
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to join game");
-    } finally {
-      setJoining(false);
+    } catch {
+      // Error already stored in the lobby store
     }
   };
 
@@ -124,10 +97,10 @@ export default function HomePage() {
               {/* Create Game */}
               <button
                 onClick={handleCreateGame}
-                disabled={creating}
+                disabled={loading}
                 className="w-full rounded-xl bg-heist-green/10 border-2 border-heist-green/30 px-6 py-4 text-lg font-semibold text-heist-green hover:bg-heist-green/20 hover:border-heist-green/50 disabled:opacity-50 transition-all glow-green"
               >
-                {creating ? "Creating..." : "Create New Game"}
+                {loading ? "Creating..." : "Create New Game"}
               </button>
 
               {/* Divider */}
@@ -148,10 +121,10 @@ export default function HomePage() {
                 />
                 <button
                   onClick={handleJoinGame}
-                  disabled={joining || !joinCode.trim()}
+                  disabled={loading || !joinCode.trim()}
                   className="rounded-xl bg-heist-blue/10 border border-heist-blue/30 px-6 py-3 font-semibold text-heist-blue hover:bg-heist-blue/20 disabled:opacity-50 transition-all"
                 >
-                  {joining ? "Joining..." : "Join"}
+                  {loading ? "Joining..." : "Join"}
                 </button>
               </div>
 
@@ -171,32 +144,23 @@ export default function HomePage() {
             <div className="grid grid-cols-2 gap-3 text-sm">
               <div className="flex gap-2">
                 <span className="text-heist-gold">&#9670;</span>
-                <span className="text-gray-300">
-                  Collect loot to score points
-                </span>
+                <span className="text-gray-300">Collect loot to score points</span>
               </div>
               <div className="flex gap-2">
                 <span className="text-camera">&#9673;</span>
-                <span className="text-gray-300">
-                  Cameras deduct 1 point
-                </span>
+                <span className="text-gray-300">Cameras deduct 1 point</span>
               </div>
               <div className="flex gap-2">
                 <span className="text-laser">&#9473;</span>
-                <span className="text-gray-300">
-                  Lasers deduct 2 points
-                </span>
+                <span className="text-gray-300">Lasers deduct 2 points</span>
               </div>
               <div className="flex gap-2">
                 <span className="text-gray-500">&#9632;</span>
-                <span className="text-gray-300">
-                  Fog hides unexplored areas
-                </span>
+                <span className="text-gray-300">Fog hides unexplored areas</span>
               </div>
             </div>
             <p className="text-xs text-gray-500">
-              12x12 grid. 5 minutes per game. Highest score wins.
-              Testnet only.
+              12x12 grid. 5 minutes per game. Highest score wins. Testnet only.
             </p>
           </div>
         </div>
