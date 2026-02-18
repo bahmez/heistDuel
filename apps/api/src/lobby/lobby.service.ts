@@ -223,7 +223,8 @@ export class LobbyService {
       await this.handleRevealSeeds(gameId, result.confirmedViaSequence);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      this.logger.error(`[start_game] Failed: ${msg}`);
+      const stack = err instanceof Error ? err.stack : undefined;
+      this.logger.error(`[start_game] Failed: ${msg}`, stack);
       await this.dbLobby.update(gameId, { phase: 'error', error: msg });
     }
   }
@@ -307,7 +308,8 @@ export class LobbyService {
       this.logger.log(`[${gameId}] Phase → active 🎮`);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      this.logger.error(`[begin_match] Failed: ${msg}`);
+      const stack = err instanceof Error ? err.stack : undefined;
+      this.logger.error(`[begin_match] Failed: ${msg}`, stack);
       await this.dbLobby.update(gameId, { phase: 'error', error: msg });
     }
   }

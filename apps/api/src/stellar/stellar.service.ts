@@ -56,8 +56,15 @@ export class StellarService implements OnModuleInit {
     }
 
     const secret = process.env.SOURCE_SECRET;
+    const isCloudRun = !!process.env.K_SERVICE;
 
     if (!secret) {
+      if (isCloudRun) {
+        throw new Error(
+          'SOURCE_SECRET is missing in Cloud Run. ' +
+            'Set _API_SOURCE_SECRET (or SOURCE_SECRET) for the API service.',
+        );
+      }
       this.logger.warn(
         'SOURCE_SECRET not set — generating a temporary keypair. ' +
           'Multi-auth transactions will fail until the account is funded.',

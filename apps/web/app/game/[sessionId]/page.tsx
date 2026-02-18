@@ -284,6 +284,7 @@ export default function GamePage({
             player1={lobby?.player1 ?? ""}
             player2={lobby?.player2 ?? null}
             phase={lobby?.phase ?? game.lobbyPhase ?? "waiting"}
+            error={lobby?.error ?? undefined}
           />
         </div>
       </div>

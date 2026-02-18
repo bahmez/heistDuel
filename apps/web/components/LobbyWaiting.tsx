@@ -8,6 +8,7 @@ interface LobbyWaitingProps {
   player1: string;
   player2: string | null;
   phase: string;
+  error?: string;
 }
 
 export function LobbyWaiting({
@@ -16,6 +17,7 @@ export function LobbyWaiting({
   player1,
   player2,
   phase,
+  error,
 }: LobbyWaitingProps) {
   const [copied, setCopied] = useState(false);
   const appUrlFromEnv = process.env.NEXT_PUBLIC_APP_URL?.trim() ?? "";
@@ -106,6 +108,12 @@ export function LobbyWaiting({
             </span>
           </div>
         </div>
+
+        {error && (
+          <div className="mb-4 rounded-lg bg-heist-red/10 border border-heist-red/30 p-3 text-sm text-heist-red break-words">
+            {error}
+          </div>
+        )}
 
         {phase === "waiting" && !player2 && (
           <div className="mt-4">
