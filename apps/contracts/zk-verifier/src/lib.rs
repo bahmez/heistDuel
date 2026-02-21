@@ -56,49 +56,40 @@ impl ZkVerifierContract {
         vk_hash
     }
 
-    pub fn verify_proof_with_stored_vk(
-        env: Env,
-        proof_blob: Bytes,
-        public_inputs_hash: BytesN<32>,
-    ) -> BytesN<32> {
-        let vk_hash: BytesN<32> = env
+    /// Verifies a proof blob produced by the Noir turn_validity circuit.
+    ///
+    /// Expected proof_blob layout (matches UltraHonk / Barretenberg wire format):
+    ///   bytes  0..4   — big-endian u32 count of public inputs (must be 1)
+    ///   bytes  4..36  — the single public input (pi_hash, 32 bytes)
+    ///   bytes 36..    — actual UltraHonk proof bytes
+    ///
+    /// The heist contract already verifies that pi_hash matches the computed
+    /// expected value before calling this function, so the verifier only needs
+    /// to check the structural format and (in production) the cryptographic proof.
+    ///
+    /// This mock implementation performs a structural sanity check only.
+    /// In production, replace with the real UltraHonk verifier from
+    /// github.com/aztecprotocol/ultrahonk_soroban_contract.
+    pub fn verify_proof_with_stored_vk(env: Env, proof_blob: Bytes) -> BytesN<32> {
+        // VK must be set before any proof is accepted.
+        let _vk_hash: BytesN<32> = env
             .storage()
             .instance()
             .get(&Self::key_vk_hash())
             .or_else(|| env.storage().instance().get(&DataKey::VkHash))
             .expect("vk not set");
 
-        if proof_blob.len() < 65 {
+        // Minimum: 4-byte count header + 32-byte pi_hash.
+        if proof_blob.len() < 36 {
             panic_with_error!(&env, Error::InvalidProof);
         }
 
-        // Lightweight proof sanity check for contract-level integration tests:
-        // first byte must be 1, bytes [1..33] must match stored vk hash,
-        // bytes [33..65] must match public_inputs_hash.
-        let marker = proof_blob.get(0).unwrap_or(0);
-        if marker != 1 {
-            panic_with_error!(&env, Error::InvalidProof);
-        }
-
-        let mut prefix = [0u8; 32];
-        let mut i = 0u32;
-        while i < 32 {
-            prefix[i as usize] = proof_blob.get(i + 1).unwrap_or(0);
-            i += 1;
-        }
-        let prefix_bn = BytesN::from_array(&env, &prefix);
-        if prefix_bn != vk_hash {
-            panic_with_error!(&env, Error::InvalidProof);
-        }
-
-        let mut pub_hash_prefix = [0u8; 32];
-        let mut j = 0u32;
-        while j < 32 {
-            pub_hash_prefix[j as usize] = proof_blob.get(j + 33).unwrap_or(0);
-            j += 1;
-        }
-        let pub_hash_bn = BytesN::from_array(&env, &pub_hash_prefix);
-        if pub_hash_bn != public_inputs_hash {
+        // Count must be exactly 1 (one public input: pi_hash).
+        let count = ((proof_blob.get(0).unwrap_or(0) as u32) << 24)
+            | ((proof_blob.get(1).unwrap_or(0) as u32) << 16)
+            | ((proof_blob.get(2).unwrap_or(0) as u32) << 8)
+            | (proof_blob.get(3).unwrap_or(0) as u32);
+        if count != 1 {
             panic_with_error!(&env, Error::InvalidProof);
         }
 

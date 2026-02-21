@@ -47,6 +47,8 @@ export class LobbyService {
       player2: input.player2,
       player2SeedCommit: input.player2SeedCommit,
       player2SeedSecret: input.player2SeedSecret ?? null,
+      player2MapSeedCommit: input.player2MapSeedCommit ?? null,
+      player2MapSeedSecret: input.player2MapSeedSecret ?? null,
     });
   }
 

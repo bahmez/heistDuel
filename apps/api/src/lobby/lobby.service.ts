@@ -5,6 +5,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { authorizeEntry, xdr } from '@stellar/stellar-sdk';
+import { createHash } from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { LobbyService as DbLobbyService } from '@repo/database';
 import type {
@@ -26,7 +27,7 @@ const POST_SEQ_FALLBACK_DELAY_MS = 15_000;
 
 /**
  * Sanitized lobby view sent to clients (over SSE or REST).
- * Omits seed secrets and other sensitive fields.
+ * Never includes seed secrets or map secrets.
  */
 export interface LobbyPublicView {
   gameId: string;
@@ -36,25 +37,31 @@ export interface LobbyPublicView {
   phase: LobbyPhase;
   createdAt: string;
   error?: string;
-  /** Present during signing phases — tells the client which preimage to sign. */
   pendingAuthRequest: PendingAuthRequest | null;
+}
+
+/**
+ * Payload returned to a player after the backend relays map secrets.
+ * Contains the opponent's map secret so the player can compute the shared map_seed.
+ */
+export interface MapSecretRelayResult {
+  /** The opponent's map secret (hex). Combine with your own via keccak(yours XOR theirs). */
+  opponentMapSecret: string;
 }
 
 /**
  * Application-layer lobby service.
  *
- * Handles:
- *  - Lobby creation / join
- *  - Game-start coordination (start_game → reveal_seed × 2 → begin_match)
- *  - Auth-entry signature collection via SSE + Firestore (replacing in-memory resolvers)
+ * ZK Map Relay Flow (new):
+ *  1. Players provide mapSeedCommit (on-chain) and mapSeedSecret (off-chain) at create/join.
+ *  2. After both dice seeds are revealed, backend enters 'relaying' phase.
+ *  3. Backend verifies keccak(mapSeedSecret_i) == mapSeedCommit_i (from on-chain data).
+ *  4. Backend cross-relays secrets: P1 receives secret2, P2 receives secret1.
+ *  5. Each player computes: map_seed = keccak(secret1 XOR secret2).
+ *  6. Each player computes: map_data = generate_map(map_seed), map_commitment = keccak(map_data).
+ *  7. Both players sign begin_match(map_commitment, p1_pos_commit, p2_pos_commit).
  *
- * The signature collection pattern:
- *  1. Backend stores `pendingAuthRequest` in Firestore (frontend sees it via SSE).
- *  2. Frontend signs the preimage with the player's wallet.
- *  3. Frontend POSTs the signature to POST /api/lobby/:gameId/auth-response.
- *  4. Backend writes `signatureResponse` to Firestore.
- *  5. Backend's `onSnapshot` listener detects the response and resolves the awaited Promise.
- *  6. Backend clears both fields and continues the game flow.
+ * The backend acts as a one-time relay — map secrets are cleared after relaying.
  */
 @Injectable()
 export class LobbyService {
@@ -71,6 +78,8 @@ export class LobbyService {
     playerAddress: string,
     seedCommit: string,
     seedSecret: string,
+    mapSeedCommit: string,
+    mapSeedSecret: string,
   ): Promise<{ gameId: string; sessionId: number; joinUrl: string }> {
     const gameId = uuidv4().slice(0, 8);
     const sessionId = this.generateSessionId();
@@ -81,6 +90,8 @@ export class LobbyService {
       player1: playerAddress,
       player1SeedCommit: seedCommit,
       player1SeedSecret: seedSecret,
+      player1MapSeedCommit: mapSeedCommit,
+      player1MapSeedSecret: mapSeedSecret,
     });
 
     this.logger.log(
@@ -95,6 +106,8 @@ export class LobbyService {
     playerAddress: string,
     seedCommit: string,
     seedSecret: string,
+    mapSeedCommit: string,
+    mapSeedSecret: string,
   ): Promise<LobbyDocument> {
     const lobby = await this.dbLobby.findByIdOrThrow(gameId);
 
@@ -109,11 +122,12 @@ export class LobbyService {
       player2: playerAddress,
       player2SeedCommit: seedCommit,
       player2SeedSecret: seedSecret,
+      player2MapSeedCommit: mapSeedCommit,
+      player2MapSeedSecret: mapSeedSecret,
     });
 
     this.logger.log(`Player 2 joined — gameId: ${gameId}, player2: ${playerAddress}`);
 
-    // Kick off the game setup flow in the background (non-blocking)
     this.initiateStartGame(gameId).catch((err: Error) => {
       this.logger.error(
         `Game setup failed for ${gameId}: ${err.message}`,
@@ -128,22 +142,11 @@ export class LobbyService {
     return this.dbLobby.findByIdOrThrow(gameId);
   }
 
-  /**
-   * Return the sanitized lobby state safe for the client.
-   * Used by both the REST GET endpoint and the SSE stream.
-   */
   async getLobbyPublicView(gameId: string): Promise<LobbyPublicView> {
     const lobby = await this.dbLobby.findByIdOrThrow(gameId);
     return this.sanitize(lobby);
   }
 
-  /**
-   * Subscribe to real-time Firestore changes for a lobby and push the
-   * sanitized `LobbyPublicView` to the callback on every update.
-   *
-   * Used by the SSE endpoint — the returned unsubscribe function should be
-   * called when the SSE connection closes.
-   */
   subscribeToLobby(
     gameId: string,
     callback: (view: LobbyPublicView) => void,
@@ -153,12 +156,6 @@ export class LobbyService {
     });
   }
 
-  /**
-   * Receive a signed auth entry from the frontend.
-   * Writes the `signatureResponse` to Firestore — the backend's `onSnapshot`
-   * listener (in `requestRemoteSignature`) will pick it up and resolve the
-   * awaited Promise, replacing the old in-memory resolver map.
-   */
   async receiveAuthSignature(
     gameId: string,
     purpose: string,
@@ -175,18 +172,69 @@ export class LobbyService {
     };
 
     await this.dbLobby.setSignatureResponse(gameId, response);
-    this.logger.debug(`[${purpose}] signatureResponse written to Firestore`);
+  }
+
+  /**
+   * Map secret relay endpoint.
+   *
+   * Called by each player to submit their map_secret to the backend.
+   * Once both secrets are received and verified against on-chain commitments,
+   * the backend returns the opponent's secret.
+   *
+   * Security: the backend verifies keccak(secret) == mapSeedCommit before relaying.
+   */
+  async relayMapSecret(
+    gameId: string,
+    playerAddress: string,
+    mapSecret: string,
+  ): Promise<MapSecretRelayResult> {
+    const lobby = await this.dbLobby.findByIdOrThrow(gameId);
+
+    if (lobby.phase !== 'relaying') {
+      throw new BadRequestException(
+        `Cannot relay map secret in phase '${lobby.phase}'. Wait until phase is 'relaying'.`,
+      );
+    }
+
+    const isPlayer1 = lobby.player1 === playerAddress;
+    const isPlayer2 = lobby.player2 === playerAddress;
+
+    if (!isPlayer1 && !isPlayer2) {
+      throw new BadRequestException('Not a player in this lobby');
+    }
+
+    // Verify the provided secret matches the on-chain commitment.
+    const expectedCommit = isPlayer1
+      ? lobby.player1MapSeedCommit
+      : lobby.player2MapSeedCommit;
+
+    if (!expectedCommit) {
+      throw new BadRequestException('Map seed commitment not found for player');
+    }
+
+    const computedCommit = this.keccakHex(mapSecret);
+    if (computedCommit !== expectedCommit.toLowerCase()) {
+      throw new BadRequestException('Map secret does not match on-chain commitment');
+    }
+
+    // Return the opponent's secret (which the backend already has from create/join).
+    const opponentSecret = isPlayer1
+      ? lobby.player2MapSeedSecret
+      : lobby.player1MapSeedSecret;
+
+    if (!opponentSecret) {
+      throw new NotFoundException('Opponent map secret not yet available. Try again shortly.');
+    }
+
+    this.logger.log(
+      `[${gameId}] Map secret relay for ${playerAddress} — opponent secret delivered`,
+    );
+
+    return { opponentMapSecret: opponentSecret };
   }
 
   // ─── Game Setup Flow ────────────────────────────────────────────────────────
 
-  /**
-   * Orchestrates the full game initialization sequence:
-   *   start_game → reveal_seed (×2) → begin_match
-   *
-   * Runs entirely in the background after player 2 joins.
-   * Updates lobby phase in Firestore so the frontend tracks progress via SSE.
-   */
   private async initiateStartGame(gameId: string): Promise<void> {
     const lobby = await this.dbLobby.findByIdOrThrow(gameId);
 
@@ -202,6 +250,8 @@ export class LobbyService {
 
     const p1Commit = this.hexToBytes(lobby.player1SeedCommit);
     const p2Commit = this.hexToBytes(lobby.player2SeedCommit);
+    const p1MapCommit = this.hexToBytes(lobby.player1MapSeedCommit ?? '');
+    const p2MapCommit = this.hexToBytes(lobby.player2MapSeedCommit ?? '');
 
     try {
       const { txXdr, authInfos } = await client.buildStartGameTx(
@@ -213,6 +263,8 @@ export class LobbyService {
         0n,
         p1Commit,
         p2Commit,
+        p1MapCommit,
+        p2MapCommit,
       );
 
       this.logger.log(`[start_game] Built tx with ${authInfos.length} auth entries`);
@@ -270,18 +322,27 @@ export class LobbyService {
     if (res2.confirmedViaSequence) anySeqFallback = true;
 
     if (anySeqFallback) {
-      this.logger.log(
-        `[${gameId}] Waiting ${POST_SEQ_FALLBACK_DELAY_MS / 1000}s for RPC to catch up after sequence-fallback...`,
-      );
       await this.stellar.sleep(POST_SEQ_FALLBACK_DELAY_MS);
     }
 
-    await this.handleBeginMatch(gameId, anySeqFallback);
+    // Enter relaying phase — players must now call POST /lobby/:gameId/map-secret
+    // to exchange their map secrets via the backend relay.
+    // The backend transitions to 'beginning' once both players have the opponent secret
+    // and are ready to call begin_match.
+    await this.dbLobby.update(gameId, { phase: 'relaying' });
+    this.logger.log(`[${gameId}] Phase → relaying (awaiting begin_match from players)`);
   }
 
-  private async handleBeginMatch(
+  /**
+   * Called by a player after they have exchanged map secrets and computed
+   * map_commitment, p1_pos_commit, p2_pos_commit locally.
+   * Both players must submit the same map_commitment for begin_match to succeed.
+   */
+  async handleBeginMatch(
     gameId: string,
-    useExtendedRetry: boolean,
+    mapCommitment: string,
+    p1PosCommit: string,
+    p2PosCommit: string,
   ): Promise<void> {
     await this.dbLobby.update(gameId, { phase: 'beginning' });
     this.logger.log(`[${gameId}] Phase → beginning`);
@@ -290,22 +351,30 @@ export class LobbyService {
     const client = this.stellar.getClient();
     const source = this.stellar.getSourceAddress();
 
-    const retryOpts = useExtendedRetry
-      ? { maxAttempts: SIM_RETRY_ATTEMPTS_EXTENDED, delayMs: SIM_RETRY_DELAY_MS_EXTENDED }
-      : undefined;
-
     try {
       const { txXdr, authInfos } = await this.withSimulationRetry(
         'begin_match_build',
-        () => client.buildBeginMatchTx(source, lobby.sessionId),
-        retryOpts,
+        () =>
+          client.buildBeginMatchTx(
+            source,
+            lobby.sessionId,
+            this.hexToBytes(mapCommitment),
+            this.hexToBytes(p1PosCommit),
+            this.hexToBytes(p2PosCommit),
+          ),
+        { maxAttempts: SIM_RETRY_ATTEMPTS_EXTENDED, delayMs: SIM_RETRY_DELAY_MS_EXTENDED },
       );
 
       const result = await this.signAllAndSubmit(gameId, 'begin_match', txXdr, authInfos);
       this.logger.log(`[begin_match] Confirmed: ${result.hash}`);
 
-      await this.dbLobby.update(gameId, { phase: 'active' });
-      this.logger.log(`[${gameId}] Phase → active 🎮`);
+      // Clear map secrets now that they are no longer needed.
+      await this.dbLobby.update(gameId, {
+        phase: 'active',
+        player1MapSeedSecret: null,
+        player2MapSeedSecret: null,
+      });
+      this.logger.log(`[${gameId}] Phase → active (map secrets cleared)`);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       const stack = err instanceof Error ? err.stack : undefined;
@@ -316,14 +385,6 @@ export class LobbyService {
 
   // ─── Auth Signature Coordination ────────────────────────────────────────────
 
-  /**
-   * Sign all auth entries for a transaction and submit it.
-   *
-   * Auth entries are processed ONE AT A TIME (sequentially) because
-   * Firestore only holds a single `pendingAuthRequest` slot per lobby.
-   * Running them in parallel would cause concurrent writes to overwrite
-   * each other, making some signature requests invisible to the frontend.
-   */
   private async signAllAndSubmit(
     gameId: string,
     purpose: string,
@@ -363,26 +424,11 @@ export class LobbyService {
         info.index,
         signedEntry.toXDR('base64'),
       );
-
-      this.logger.log(`[${purpose}] Entry #${info.index} signed — tx updated`);
     }
 
     return this.stellar.signAndSubmit(finalTxXdr, purpose);
   }
 
-  /**
-   * Request a signature from a player's wallet via SSE + Firestore signaling.
-   *
-   * Flow:
-   *  1. Clear any stale `signatureResponse` from a previous round.
-   *  2. Write `pendingAuthRequest` to Firestore → frontend sees it via SSE and signs.
-   *  3. Frontend POSTs the signature → `receiveAuthSignature()` writes `signatureResponse`.
-   *  4. Firestore `onSnapshot` detects the write → Promise resolves with the signature.
-   *  5. Clear both Firestore fields and continue.
-   *
-   * Replaces the old in-memory `sigResolvers` Map — the signal now travels through
-   * Firestore so it survives API restarts and is durably stored.
-   */
   private async requestRemoteSignature(
     gameId: string,
     purpose: string,
@@ -395,10 +441,8 @@ export class LobbyService {
       async (preimage) => {
         const preimageXdr = preimage.toXDR('base64');
 
-        // Clear any stale response from a previous signing round
         await this.dbLobby.clearSignatureResponse(gameId).catch(() => {});
 
-        // Write the pending request — SSE will push it to the frontend immediately
         const pendingReq: PendingAuthRequest = {
           purpose,
           playerAddress,
@@ -406,9 +450,6 @@ export class LobbyService {
           requestedAt: new Date().toISOString(),
         };
         await this.dbLobby.setPendingAuthRequest(gameId, pendingReq);
-        this.logger.log(
-          `[${purpose}] pendingAuthRequest written to Firestore for ${playerAddress}`,
-        );
 
         return new Promise<Buffer>((resolve, reject) => {
           let unsubscribe: (() => void) | null = null;
@@ -419,7 +460,6 @@ export class LobbyService {
             reject(new Error(`Signature timeout for ${playerAddress} (${purpose})`));
           }, SIGN_TIMEOUT_MS);
 
-          // Listen for the signatureResponse in Firestore instead of an in-memory map
           unsubscribe = this.dbLobby.onSnapshot(gameId, async (lobby) => {
             const resp = lobby.signatureResponse;
             if (
@@ -430,21 +470,13 @@ export class LobbyService {
               clearTimeout(timeout);
               if (unsubscribe) unsubscribe();
 
-              // Clean up Firestore fields before resolving
               await Promise.all([
                 this.dbLobby.clearPendingAuthRequest(gameId),
                 this.dbLobby.clearSignatureResponse(gameId),
               ]).catch(() => {});
 
-              this.logger.log(
-                `[${purpose}] Signature received via Firestore for ${playerAddress}`,
-              );
-
               try {
                 const normalized = this.stellar.normalizeWalletSignature(resp.signatureBase64);
-                this.logger.debug(
-                  `[${purpose}] Normalized signature length: ${normalized.length}`,
-                );
                 resolve(normalized);
               } catch (err) {
                 const msg = err instanceof Error ? err.message : String(err);
@@ -461,7 +493,6 @@ export class LobbyService {
 
   // ─── Helpers ────────────────────────────────────────────────────────────────
 
-  /** Strip sensitive fields before sending lobby data to the client. */
   private sanitize(doc: LobbyDocument): LobbyPublicView {
     return {
       gameId: doc.gameId,
@@ -475,11 +506,17 @@ export class LobbyService {
     };
   }
 
+  /** Compute keccak256 of a hex string and return as hex. */
+  private keccakHex(hexInput: string): string {
+    const bytes = Buffer.from(hexInput, 'hex');
+    return createHash('sha3-256').update(bytes).digest('hex');
+  }
+
   private isRetriableSimulationError(msg: string): boolean {
     return (
-      msg.includes('Error(Contract, #1)') || // GameNotFound
-      msg.includes('Error(Contract, #7)') || // SeedsNotReady
-      msg.includes('Error(Contract, #17)')   // InvalidStatus
+      msg.includes('Error(Contract, #1)') ||
+      msg.includes('Error(Contract, #7)') ||
+      msg.includes('Error(Contract, #17)')
     );
   }
 
@@ -511,8 +548,7 @@ export class LobbyService {
   }
 
   private generateSessionId(): number {
-    const candidate = Math.floor(Math.random() * 0x7fffffff) + 1;
-    return candidate;
+    return Math.floor(Math.random() * 0x7fffffff) + 1;
   }
 
   private hexToBytes(hex: string): Uint8Array {

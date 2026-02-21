@@ -10,31 +10,43 @@ import {
   Sse,
   MessageEvent,
 } from '@nestjs/common';
+import { IsString, IsNotEmpty } from 'class-validator';
 import { Observable } from 'rxjs';
 import { LobbyService } from './lobby.service';
 import { CreateLobbyDto } from './dto/create-lobby.dto';
 import { JoinLobbyDto } from './dto/join-lobby.dto';
 import { AuthResponseDto } from './dto/auth-response.dto';
 
-/**
- * HTTP controller for lobby and game-setup operations.
- *
- * Real-time lobby updates are delivered via Server-Sent Events (SSE):
- *  - GET /lobby/:gameId/events → SSE stream backed by Firestore `onSnapshot`
- *
- * Auth-entry signing still uses plain HTTP (SSE is read-only):
- *  - POST /lobby/:gameId/auth-response → submit signed preimage
- */
+class MapSecretDto {
+  @IsString()
+  @IsNotEmpty()
+  playerAddress!: string;
+
+  @IsString()
+  @IsNotEmpty()
+  mapSecret!: string;
+}
+
+class BeginMatchDto {
+  @IsString()
+  @IsNotEmpty()
+  mapCommitment!: string;
+
+  @IsString()
+  @IsNotEmpty()
+  p1PosCommit!: string;
+
+  @IsString()
+  @IsNotEmpty()
+  p2PosCommit!: string;
+}
+
 @Controller('lobby')
 export class LobbyController {
   private readonly logger = new Logger(LobbyController.name);
 
   constructor(private readonly lobbyService: LobbyService) {}
 
-  /**
-   * GET /api/lobby/health
-   * Simple liveness check.
-   */
   @Get('/health')
   health() {
     return { service: 'api', status: 'ok' };
@@ -43,6 +55,7 @@ export class LobbyController {
   /**
    * POST /api/lobby
    * Create a new game lobby for player 1.
+   * Player provides both their dice seed commit/secret and their map seed commit/secret.
    */
   @Post()
   async createLobby(@Body() dto: CreateLobbyDto) {
@@ -50,6 +63,8 @@ export class LobbyController {
       dto.playerAddress,
       dto.seedCommit,
       dto.seedSecret,
+      dto.mapSeedCommit,
+      dto.mapSeedSecret,
     );
   }
 
@@ -67,6 +82,8 @@ export class LobbyController {
       dto.playerAddress,
       dto.seedCommit,
       dto.seedSecret,
+      dto.mapSeedCommit,
+      dto.mapSeedSecret,
     );
     return {
       gameId: lobby.gameId,
@@ -76,29 +93,11 @@ export class LobbyController {
     };
   }
 
-  /**
-   * GET /api/lobby/:gameId
-   * One-shot REST snapshot of the current lobby state.
-   * Useful for initial page load before the SSE stream is established.
-   */
   @Get(':gameId')
   async getLobby(@Param('gameId') gameId: string) {
     return this.lobbyService.getLobbyPublicView(gameId);
   }
 
-  /**
-   * GET /api/lobby/:gameId/events
-   *
-   * Server-Sent Events stream for real-time lobby updates.
-   * Backed by a Firestore `onSnapshot` listener — the client receives an event
-   * immediately (current state) and then on every Firestore document change.
-   *
-   * Event payload: JSON-encoded `LobbyPublicView` (sanitized, no seed secrets).
-   * Includes `pendingAuthRequest` so the client knows when to sign.
-   *
-   * The stream stays open until the client disconnects; the Firestore listener
-   * is cleaned up via the Observable teardown (`return () => unsubscribe()`).
-   */
   @Sse(':gameId/events')
   streamLobbyEvents(
     @Param('gameId') gameId: string,
@@ -120,14 +119,6 @@ export class LobbyController {
     });
   }
 
-  /**
-   * POST /api/lobby/:gameId/auth-response
-   *
-   * Receives a signed auth-entry preimage from the frontend wallet.
-   * Writes the signature to Firestore — the backend's `onSnapshot` listener
-   * (in `requestRemoteSignature`) picks it up and resolves the awaited Promise,
-   * allowing the game-setup flow to continue.
-   */
   @Post(':gameId/auth-response')
   @HttpCode(HttpStatus.OK)
   async receiveAuthResponse(
@@ -139,6 +130,62 @@ export class LobbyController {
       dto.purpose,
       dto.playerAddress,
       dto.signatureBase64,
+    );
+    return { ok: true };
+  }
+
+  /**
+   * POST /api/lobby/:gameId/map-secret
+   *
+   * ZK Map Secret Relay endpoint.
+   *
+   * Called by each player during the 'relaying' phase.
+   * The backend verifies the secret matches the on-chain commitment, then
+   * returns the opponent's secret so both players can compute the shared map_seed.
+   *
+   * Flow:
+   *   1. Lobby enters 'relaying' phase after both dice seeds are revealed.
+   *   2. P1 calls POST /lobby/:gameId/map-secret → receives P2's secret.
+   *   3. P2 calls POST /lobby/:gameId/map-secret → receives P1's secret.
+   *   4. Each player computes: map_seed = keccak(own_secret XOR opponent_secret).
+   *   5. Each player computes: map_data = generate_map(map_seed).
+   *   6. Each player computes: map_commitment = keccak(map_data).
+   *   7. Players call POST /lobby/:gameId/begin-match with the commitments.
+   */
+  @Post(':gameId/map-secret')
+  @HttpCode(HttpStatus.OK)
+  async relayMapSecret(
+    @Param('gameId') gameId: string,
+    @Body() dto: MapSecretDto,
+  ) {
+    return this.lobbyService.relayMapSecret(
+      gameId,
+      dto.playerAddress,
+      dto.mapSecret,
+    );
+  }
+
+  /**
+   * POST /api/lobby/:gameId/begin-match
+   *
+   * Triggers the begin_match on-chain transaction.
+   * Called by any authorized party (typically the backend or a player)
+   * after both players have exchanged map secrets and computed commitments.
+   *
+   * Both players must have agreed on the same map_commitment off-chain
+   * before calling this endpoint.
+   */
+  @Post(':gameId/begin-match')
+  @HttpCode(HttpStatus.OK)
+  async beginMatch(
+    @Param('gameId') gameId: string,
+    @Body() dto: BeginMatchDto,
+  ) {
+    await this.lobbyService.handleBeginMatch(
+      gameId,
+      dto.mapCommitment,
+      dto.p1PosCommit,
+      dto.p2PosCommit,
     );
     return { ok: true };
   }

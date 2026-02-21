@@ -8,8 +8,8 @@ import {
   scValToNative,
   Keypair,
 } from "@stellar/stellar-sdk";
-import type { Position, TurnPublic, PlayerGameView, Camera, Laser } from "./types";
-import { NETWORK_PASSPHRASE, BITSET_BYTES } from "./constants";
+import type { TurnZkPublic, GameView } from "./types";
+import { NETWORK_PASSPHRASE } from "./constants";
 
 /**
  * Information about a Soroban auth entry that needs a player's signature.
@@ -49,56 +49,31 @@ function boolVal(v: boolean): xdr.ScVal {
   return nativeToScVal(v, { type: "bool" });
 }
 
-function positionVal(p: Position): xdr.ScVal {
+/**
+ * Encode a TurnZkPublic as a Soroban ScvMap.
+ * Fields must be in alphabetical order (Soroban contracttype requirement).
+ */
+function turnZkPublicVal(turn: TurnZkPublic): xdr.ScVal {
   return xdr.ScVal.scvMap([
     new xdr.ScMapEntry({
-      key: xdr.ScVal.scvSymbol("x"),
-      val: u32Val(p.x),
-    }),
-    new xdr.ScMapEntry({
-      key: xdr.ScVal.scvSymbol("y"),
-      val: u32Val(p.y),
-    }),
-  ]);
-}
-
-function positionVecVal(positions: Position[]): xdr.ScVal {
-  return xdr.ScVal.scvVec(positions.map(positionVal));
-}
-
-function turnPublicVal(turn: TurnPublic): xdr.ScVal {
-  return xdr.ScVal.scvMap([
-    new xdr.ScMapEntry({
-      key: xdr.ScVal.scvSymbol("camera_hits"),
-      val: u32Val(turn.cameraHits),
-    }),
-    new xdr.ScMapEntry({
-      key: xdr.ScVal.scvSymbol("end_pos"),
-      val: positionVal(turn.endPos),
-    }),
-    new xdr.ScMapEntry({
-      key: xdr.ScVal.scvSymbol("laser_hits"),
-      val: u32Val(turn.laserHits),
-    }),
-    new xdr.ScMapEntry({
-      key: xdr.ScVal.scvSymbol("loot_collected_mask_delta"),
-      val: bytesNVal(turn.lootCollectedMaskDelta),
+      key: xdr.ScVal.scvSymbol("loot_delta"),
+      val: u32Val(turn.lootDelta),
     }),
     new xdr.ScMapEntry({
       key: xdr.ScVal.scvSymbol("no_path_flag"),
       val: boolVal(turn.noPathFlag),
     }),
     new xdr.ScMapEntry({
-      key: xdr.ScVal.scvSymbol("path"),
-      val: positionVecVal(turn.path),
-    }),
-    new xdr.ScMapEntry({
       key: xdr.ScVal.scvSymbol("player"),
       val: addressVal(turn.player),
     }),
     new xdr.ScMapEntry({
-      key: xdr.ScVal.scvSymbol("rolled_value"),
-      val: u32Val(turn.rolledValue),
+      key: xdr.ScVal.scvSymbol("pos_commit_after"),
+      val: bytesNVal(turn.posCommitAfter),
+    }),
+    new xdr.ScMapEntry({
+      key: xdr.ScVal.scvSymbol("pos_commit_before"),
+      val: bytesNVal(turn.posCommitBefore),
     }),
     new xdr.ScMapEntry({
       key: xdr.ScVal.scvSymbol("score_delta"),
@@ -109,16 +84,12 @@ function turnPublicVal(turn: TurnPublic): xdr.ScVal {
       val: u32Val(turn.sessionId),
     }),
     new xdr.ScMapEntry({
-      key: xdr.ScVal.scvSymbol("start_pos"),
-      val: positionVal(turn.startPos),
+      key: xdr.ScVal.scvSymbol("state_commit_after"),
+      val: bytesNVal(turn.stateCommitAfter),
     }),
     new xdr.ScMapEntry({
-      key: xdr.ScVal.scvSymbol("state_hash_after"),
-      val: bytesNVal(turn.stateHashAfter),
-    }),
-    new xdr.ScMapEntry({
-      key: xdr.ScVal.scvSymbol("state_hash_before"),
-      val: bytesNVal(turn.stateHashBefore),
+      key: xdr.ScVal.scvSymbol("state_commit_before"),
+      val: bytesNVal(turn.stateCommitBefore),
     }),
     new xdr.ScMapEntry({
       key: xdr.ScVal.scvSymbol("turn_index"),
@@ -130,54 +101,6 @@ function turnPublicVal(turn: TurnPublic): xdr.ScVal {
 /* ------------------------------------------------------------------ */
 /*  ScVal decoding helpers                                             */
 /* ------------------------------------------------------------------ */
-
-function parsePosition(val: xdr.ScVal): Position {
-  const map = val.map();
-  if (!map) throw new Error("Expected map for Position");
-  let x = 0,
-    y = 0;
-  for (const entry of map) {
-    const key = entry.key().sym().toString();
-    const v = scValToNative(entry.val());
-    if (key === "x") x = Number(v);
-    if (key === "y") y = Number(v);
-  }
-  return { x, y };
-}
-
-function parseCamera(val: xdr.ScVal): Camera {
-  const map = val.map();
-  if (!map) throw new Error("Expected map for Camera");
-  let x = 0,
-    y = 0,
-    radius = 0;
-  for (const entry of map) {
-    const key = entry.key().sym().toString();
-    const v = scValToNative(entry.val());
-    if (key === "x") x = Number(v);
-    if (key === "y") y = Number(v);
-    if (key === "radius") radius = Number(v);
-  }
-  return { x, y, radius };
-}
-
-function parseLaser(val: xdr.ScVal): Laser {
-  const map = val.map();
-  if (!map) throw new Error("Expected map for Laser");
-  let x1 = 0,
-    y1 = 0,
-    x2 = 0,
-    y2 = 0;
-  for (const entry of map) {
-    const key = entry.key().sym().toString();
-    const v = scValToNative(entry.val());
-    if (key === "x1") x1 = Number(v);
-    if (key === "y1") y1 = Number(v);
-    if (key === "x2") x2 = Number(v);
-    if (key === "y2") y2 = Number(v);
-  }
-  return { x1, y1, x2, y2 };
-}
 
 function parseBytesN(val: xdr.ScVal): Uint8Array {
   return new Uint8Array(val.bytes());
@@ -197,9 +120,9 @@ function parseGameStatus(val: xdr.ScVal): string {
   return scValToNative(val);
 }
 
-function parsePlayerGameView(resultVal: xdr.ScVal): PlayerGameView {
+function parseGameView(resultVal: xdr.ScVal): GameView {
   const map = resultVal.map();
-  if (!map) throw new Error("Expected map for PlayerGameView");
+  if (!map) throw new Error("Expected map for GameView");
 
   const view: Record<string, unknown> = {};
   for (const entry of map) {
@@ -210,31 +133,26 @@ function parsePlayerGameView(resultVal: xdr.ScVal): PlayerGameView {
   return {
     player1: scValToNative(view["player1"] as xdr.ScVal),
     player2: scValToNative(view["player2"] as xdr.ScVal),
-    status: parseGameStatus(view["status"] as xdr.ScVal),
+    status: parseGameStatus(view["status"] as xdr.ScVal) as GameView["status"],
     startedAtTs: scValToNative(view["started_at_ts"] as xdr.ScVal) ?? null,
     deadlineTs: scValToNative(view["deadline_ts"] as xdr.ScVal) ?? null,
     turnIndex: Number(scValToNative(view["turn_index"] as xdr.ScVal)),
     activePlayer: scValToNative(view["active_player"] as xdr.ScVal),
-    player1Pos: parsePosition(view["player1_pos"] as xdr.ScVal),
-    player2Pos: parsePosition(view["player2_pos"] as xdr.ScVal),
     player1Score: BigInt(scValToNative(view["player1_score"] as xdr.ScVal)),
     player2Score: BigInt(scValToNative(view["player2_score"] as xdr.ScVal)),
-    lootCollected: parseBytesN(view["loot_collected"] as xdr.ScVal),
-    visibleWalls: parseBytesN(view["visible_walls"] as xdr.ScVal),
-    visibleLoot: parseBytesN(view["visible_loot"] as xdr.ScVal),
-    visibleCameras: ((view["visible_cameras"] as xdr.ScVal).vec() ?? []).map(
-      parseCamera,
-    ),
-    visibleLasers: ((view["visible_lasers"] as xdr.ScVal).vec() ?? []).map(
-      parseLaser,
-    ),
-    myFog: parseBytesN(view["my_fog"] as xdr.ScVal),
+    lootTotalCollected: Number(scValToNative(view["loot_total_collected"] as xdr.ScVal)),
+    mapCommitment: parseBytesN(view["map_commitment"] as xdr.ScVal),
+    player1PosCommit: parseBytesN(view["player1_pos_commit"] as xdr.ScVal),
+    player2PosCommit: parseBytesN(view["player2_pos_commit"] as xdr.ScVal),
+    p1MapSeedCommit: parseBytesN(view["p1_map_seed_commit"] as xdr.ScVal),
+    p2MapSeedCommit: parseBytesN(view["p2_map_seed_commit"] as xdr.ScVal),
+    stateCommitment: parseBytesN(view["state_commitment"] as xdr.ScVal),
     winner: parseOptionalAddress(view["winner"] as xdr.ScVal),
     lastProofId: (() => {
       const v = scValToNative(view["last_proof_id"] as xdr.ScVal);
       return v ? new Uint8Array(v) : null;
     })(),
-  } as PlayerGameView;
+  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -247,12 +165,11 @@ export class HeistContractClient {
   private server: rpc.Server;
   private rpcUrl: string;
 
-  constructor(
-    contractId: string,
-    rpcUrl: string,
-  ) {
+  constructor(contractId: string, rpcUrl: string) {
     this.contractId = contractId;
-    this.contract = contractId ? new Contract(contractId) : (null as unknown as Contract);
+    this.contract = contractId
+      ? new Contract(contractId)
+      : (null as unknown as Contract);
     this.server = new rpc.Server(rpcUrl);
     this.rpcUrl = rpcUrl;
   }
@@ -264,11 +181,6 @@ export class HeistContractClient {
     return this.contract;
   }
 
-  /**
-   * Parse the assembled transaction envelope, extend auth entry expiration,
-   * and return the modified transaction XDR along with auth entry info.
-   * The auth entries are sent to the frontend for signing via `authorizeEntry`.
-   */
   private processAuthEntries(
     assembled: ReturnType<TransactionBuilder["build"]>,
     latestLedger: number,
@@ -288,7 +200,6 @@ export class HeistContractClient {
           if (creds.switch().name === "sorobanCredentialsAddress") {
             const addrCreds = creds.address();
             addrCreds.signatureExpirationLedger(expiration);
-
             authInfos.push({
               index: i,
               address: Address.fromScAddress(addrCreds.address()).toString(),
@@ -303,10 +214,6 @@ export class HeistContractClient {
     return { txXdr: envelope.toXDR("base64"), authInfos };
   }
 
-  /**
-   * Replace an auth entry in a transaction XDR with a signed version.
-   * The signed entry comes from `authorizeEntry` on the frontend.
-   */
   static replaceAuthEntry(
     txXdr: string,
     authIndex: number,
@@ -328,7 +235,7 @@ export class HeistContractClient {
     return envelope.toXDR("base64");
   }
 
-  /* -- Read-only calls via simulation -- */
+  /* -- Read-only simulation calls -- */
 
   private async simulateCall(
     sourceAddress: string,
@@ -356,21 +263,16 @@ export class HeistContractClient {
     return result.retval;
   }
 
-  async getPlayerView(
+  async getStateCommitment(
     sourceAddress: string,
     sessionId: number,
-    player: string,
-  ): Promise<PlayerGameView> {
-    // get_player_view returns Result<PlayerGameView, Error>.
-    // On success the Soroban host unwraps the Ok variant: retval IS the
-    // PlayerGameView ScvMap directly (not wrapped in a ScvVec).
+  ): Promise<Uint8Array> {
     const retval = await this.simulateCall(
       sourceAddress,
-      "get_player_view",
+      "get_state_commitment",
       u32Val(sessionId),
-      addressVal(player),
     );
-    return parsePlayerGameView(retval);
+    return parseBytesN(retval);
   }
 
   async getExpectedRoll(
@@ -378,7 +280,6 @@ export class HeistContractClient {
     sessionId: number,
     player: string,
   ): Promise<number> {
-    // Returns Result<u32, Error> — retval IS the u32 ScVal directly.
     const retval = await this.simulateCall(
       sourceAddress,
       "get_expected_roll",
@@ -388,93 +289,19 @@ export class HeistContractClient {
     return Number(scValToNative(retval));
   }
 
-  async getStateHash(
+  /** Compute the pi_hash for a given TurnZkPublic (used to build proof_blob). */
+  async computePiHash(
     sourceAddress: string,
     sessionId: number,
-  ): Promise<Uint8Array> {
-    // Returns Result<BytesN<32>, Error> — retval IS the bytes ScVal directly.
-    const retval = await this.simulateCall(
-      sourceAddress,
-      "get_state_hash",
-      u32Val(sessionId),
-    );
-    return parseBytesN(retval);
-  }
-
-  async simulateStateHashAfter(
-    sourceAddress: string,
-    sessionId: number,
-    turn: TurnPublic,
-  ): Promise<Uint8Array> {
-    // Returns Result<BytesN<32>, Error> — retval IS the bytes ScVal directly.
-    const retval = await this.simulateCall(
-      sourceAddress,
-      "simulate_state_hash_after",
-      u32Val(sessionId),
-      turnPublicVal(turn),
-    );
-    return parseBytesN(retval);
-  }
-
-  async hashTurnPublic(
-    sourceAddress: string,
-    turn: TurnPublic,
+    turn: TurnZkPublic,
   ): Promise<Uint8Array> {
     const retval = await this.simulateCall(
       sourceAddress,
-      "hash_turn_public",
-      turnPublicVal(turn),
+      "compute_pi_hash",
+      u32Val(sessionId),
+      turnZkPublicVal(turn),
     );
     return parseBytesN(retval);
-  }
-
-  /**
-   * Returns the loot-collected mask delta that the contract would compute for
-   * a given path, based on the *current* on-chain loot state.
-   * Use this in `buildTurn` to avoid submitting stale/incorrect loot deltas
-   * caused by the client view being out of date.
-   */
-  async getPathLootDelta(
-    sourceAddress: string,
-    sessionId: number,
-    path: Position[],
-  ): Promise<Uint8Array> {
-    // Returns Result<BytesN<18>, Error>  →  on success: bytes ScVal directly
-    const retval = await this.simulateCall(
-      sourceAddress,
-      "get_path_loot_delta",
-      u32Val(sessionId),
-      positionVecVal(path),
-    );
-    return parseBytesN(retval);
-  }
-
-  /**
-   * Returns the (camera_hits, laser_hits) the contract would compute for a
-   * given path.  This accounts for ALL cameras/lasers on the map, including
-   * those the player cannot see due to fog-of-war.  Use this when building a
-   * turn to ensure the submitted hazard counts match what the contract expects.
-   */
-  async getPathHazards(
-    sourceAddress: string,
-    sessionId: number,
-    path: Position[],
-  ): Promise<{ cameraHits: number; laserHits: number }> {
-    // Returns Result<(u32, u32), Error>  →  on success: ScvVec([u32, u32])
-    const retval = await this.simulateCall(
-      sourceAddress,
-      "get_path_hazards",
-      u32Val(sessionId),
-      positionVecVal(path),
-    );
-    const vec = retval.vec();
-    if (!vec || vec.length !== 2) {
-      throw new Error("Unexpected get_path_hazards result");
-    }
-    return {
-      cameraHits: Number(scValToNative(vec[0]!)),
-      laserHits: Number(scValToNative(vec[1]!)),
-    };
   }
 
   async getVkHash(
@@ -497,15 +324,23 @@ export class HeistContractClient {
     const result = sim.result;
     if (!result) return null;
     try {
-      // The verifier's get_vk_hash returns BytesN<32> directly (no Result wrapper).
       return parseBytesN(result.retval);
     } catch {
       return null;
     }
   }
 
-  /* -- Transaction building (for signing externally) -- */
+  /* -- Transaction builders -- */
 
+  /**
+   * Build the start_game transaction.
+   *
+   * Both players must sign with their respective auth entries.
+   * Each player commits to two secrets:
+   *  - seedCommit: for dice randomness (revealed later via reveal_seed)
+   *  - mapSeedCommit: for map generation (secret never revealed on-chain;
+   *    relayed off-chain via backend after both seeds are revealed)
+   */
   async buildStartGameTx(
     sourceAddress: string,
     sessionId: number,
@@ -515,6 +350,8 @@ export class HeistContractClient {
     player2Points: bigint,
     p1SeedCommit: Uint8Array,
     p2SeedCommit: Uint8Array,
+    p1MapSeedCommit: Uint8Array,
+    p2MapSeedCommit: Uint8Array,
   ): Promise<{ txXdr: string; authInfos: AuthEntryInfo[] }> {
     const account = await this.server.getAccount(sourceAddress);
     const tx = new TransactionBuilder(account, {
@@ -531,6 +368,8 @@ export class HeistContractClient {
           i128Val(player2Points),
           bytesNVal(p1SeedCommit),
           bytesNVal(p2SeedCommit),
+          bytesNVal(p1MapSeedCommit),
+          bytesNVal(p2MapSeedCommit),
         ),
       )
       .setTimeout(300)
@@ -579,16 +418,35 @@ export class HeistContractClient {
     return this.processAuthEntries(assembled, sim.latestLedger);
   }
 
+  /**
+   * Build the begin_match transaction.
+   *
+   * Requires both players to sign. The map_commitment is agreed off-chain:
+   * each player computes map_seed = keccak(secret1 XOR secret2) then
+   * map_commitment = keccak(generate_map(map_seed)) and both provide the
+   * same value here. Initial position commitments are provided by each player.
+   */
   async buildBeginMatchTx(
     sourceAddress: string,
     sessionId: number,
+    mapCommitment: Uint8Array,
+    p1PosCommit: Uint8Array,
+    p2PosCommit: Uint8Array,
   ): Promise<{ txXdr: string; authInfos: AuthEntryInfo[] }> {
     const account = await this.server.getAccount(sourceAddress);
     const tx = new TransactionBuilder(account, {
       fee: "10000000",
       networkPassphrase: NETWORK_PASSPHRASE,
     })
-      .addOperation(this.ensureContract().call("begin_match", u32Val(sessionId)))
+      .addOperation(
+        this.ensureContract().call(
+          "begin_match",
+          u32Val(sessionId),
+          bytesNVal(mapCommitment),
+          bytesNVal(p1PosCommit),
+          bytesNVal(p2PosCommit),
+        ),
+      )
       .setTimeout(300)
       .build();
 
@@ -606,7 +464,7 @@ export class HeistContractClient {
     sessionId: number,
     player: string,
     proofBlob: Uint8Array,
-    turn: TurnPublic,
+    turn: TurnZkPublic,
   ): Promise<{ txXdr: string; authInfos: AuthEntryInfo[] }> {
     const account = await this.server.getAccount(sourceAddress);
     const tx = new TransactionBuilder(account, {
@@ -619,7 +477,7 @@ export class HeistContractClient {
           u32Val(sessionId),
           addressVal(player),
           bytesNVal(proofBlob),
-          turnPublicVal(turn),
+          turnZkPublicVal(turn),
         ),
       )
       .setTimeout(300)
@@ -634,11 +492,6 @@ export class HeistContractClient {
     return this.processAuthEntries(assembled, sim.latestLedger);
   }
 
-  /**
-   * Build a transaction that calls `end_if_finished` — callable by anyone,
-   * no auth entries required.  Use this when a `submit_turn` simulation fails
-   * with `TimerExpired` to finalize the game on-chain.
-   */
   async buildEndIfFinishedTx(
     sourceAddress: string,
     sessionId: number,
@@ -662,15 +515,16 @@ export class HeistContractClient {
     return assembled.toXDR();
   }
 
-  /**
-   * Submit a fully signed transaction to the network and wait for confirmation.
-   */
-  async submitTx(signedTxXdr: string): Promise<rpc.Api.GetSuccessfulTransactionResponse> {
+  async submitTx(
+    signedTxXdr: string,
+  ): Promise<rpc.Api.GetSuccessfulTransactionResponse> {
     const tx = TransactionBuilder.fromXDR(signedTxXdr, NETWORK_PASSPHRASE);
     const sendResult = await this.server.sendTransaction(tx);
 
     if (sendResult.status === "ERROR") {
-      throw new Error(`Send failed: ${sendResult.errorResult?.toXDR("base64")}`);
+      throw new Error(
+        `Send failed: ${sendResult.errorResult?.toXDR("base64")}`,
+      );
     }
 
     let getResult = await this.server.getTransaction(sendResult.hash);
@@ -685,13 +539,7 @@ export class HeistContractClient {
     throw new Error(`Transaction failed: ${getResult.status}`);
   }
 
-  /**
-   * Replace unsigned auth entries in a transaction XDR with signed ones.
-   */
-  static replaceAuthEntries(
-    txXdr: string,
-    signedAuthEntries: string[],
-  ): string {
+  static replaceAuthEntries(txXdr: string, signedAuthEntries: string[]): string {
     const envelope = xdr.TransactionEnvelope.fromXDR(txXdr, "base64");
     const txBody = envelope.v1().tx();
     const ops = txBody.operations();
@@ -709,9 +557,6 @@ export class HeistContractClient {
     return envelope.toXDR("base64");
   }
 
-  /**
-   * Sign the outer transaction envelope with a keypair (for the source account).
-   */
   static signWithKeypair(txXdr: string, keypair: Keypair): string {
     const tx = TransactionBuilder.fromXDR(txXdr, NETWORK_PASSPHRASE);
     tx.sign(keypair);

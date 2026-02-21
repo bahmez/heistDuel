@@ -12,4 +12,14 @@ export class CreateLobbyDto {
   @IsString()
   @IsNotEmpty()
   seedSecret!: string;
+
+  /** keccak(mapSeedSecret) — committed on-chain. */
+  @IsString()
+  @IsNotEmpty()
+  mapSeedCommit!: string;
+
+  /** Hex-encoded 32-byte map secret — stored temporarily, relayed to opponent after seeds are revealed. */
+  @IsString()
+  @IsNotEmpty()
+  mapSeedSecret!: string;
 }
