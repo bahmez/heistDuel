@@ -5,13 +5,6 @@ import { useRouter } from "next/navigation";
 import { WalletButton } from "../components/WalletButton";
 import { useWallet } from "../lib/wallet-context";
 import { useLobbyStore } from "../stores/lobby-store";
-import { generateRandomSeed, commitHash } from "@repo/stellar";
-
-function bytesToHex(bytes: Uint8Array): string {
-  return Array.from(bytes)
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-}
 
 export default function HomePage() {
   const router = useRouter();
@@ -24,14 +17,7 @@ export default function HomePage() {
     clearError();
 
     try {
-      const seedSecret = generateRandomSeed();
-      const seedCommit = commitHash(seedSecret);
-
-      const gameId = await createLobby(
-        address,
-        bytesToHex(seedCommit),
-        bytesToHex(seedSecret),
-      );
+      const gameId = await createLobby(address);
 
       router.push(`/game/${gameId}`);
     } catch {
@@ -44,16 +30,9 @@ export default function HomePage() {
     clearError();
 
     try {
-      const seedSecret = generateRandomSeed();
-      const seedCommit = commitHash(seedSecret);
       const gameId = joinCode.trim();
 
-      await joinLobby(
-        gameId,
-        address,
-        bytesToHex(seedCommit),
-        bytesToHex(seedSecret),
-      );
+      await joinLobby(gameId, address);
 
       router.push(`/game/${gameId}`);
     } catch {
