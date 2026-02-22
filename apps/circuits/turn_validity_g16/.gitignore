@@ -1,2 +1,7 @@
-build
+build/*
+!build/turn_validity_final.zkey
+!build/vk.bin
+!build/turn_validity_js/
+build/turn_validity_js/*
+!build/turn_validity_js/turn_validity.wasm
 circom.exe
