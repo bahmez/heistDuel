@@ -20,7 +20,8 @@
   },
   "dependencies": {
     "@stellar/stellar-sdk": "^14.5.0",
-    "js-sha3": "^0.9.3"
+    "js-sha3": "^0.9.3",
+    "poseidon-lite": "^0.2.1"
   },
   "devDependencies": {
     "tsup": "^8.3.5",

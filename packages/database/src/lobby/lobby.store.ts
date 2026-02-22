@@ -128,6 +128,47 @@ export class LobbyStore {
       });
   }
 
+  /**
+   * Atomically claim the 'beginning' phase using a Firestore transaction.
+   * Returns true if this caller successfully transitioned phase from 'relaying'
+   * to 'beginning' (this caller should run the begin_match tx).
+   * Returns false if another caller already claimed it (this caller should wait).
+   */
+  async atomicClaimBeginning(gameId: string): Promise<boolean> {
+    const ref = this.collection().doc(gameId);
+    return this.db.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      if (!snap.exists) return false;
+      const data = snap.data() as LobbyDocument;
+      if (data.phase !== 'relaying') return false;
+      tx.update(ref, { phase: 'beginning', updatedAt: new Date().toISOString() });
+      return true;
+    });
+  }
+
+  /**
+   * Poll for sessionSeed with exponential back-off. Used by the second player
+   * who lost the atomic claim race and must wait for the first player's tx.
+   */
+  async waitForSessionSeed(
+    gameId: string,
+    timeoutMs = 90_000,
+  ): Promise<string | null> {
+    const deadline = Date.now() + timeoutMs;
+    let delay = 500;
+    while (Date.now() < deadline) {
+      const snap = await this.collection().doc(gameId).get();
+      if (snap.exists) {
+        const data = snap.data() as LobbyDocument;
+        if (data.sessionSeed) return data.sessionSeed;
+        if (data.phase === 'error') return null;
+      }
+      await new Promise((r) => setTimeout(r, delay));
+      delay = Math.min(delay * 1.5, 4_000);
+    }
+    return null;
+  }
+
   /** Delete a lobby document. */
   async delete(gameId: string): Promise<void> {
     await this.collection().doc(gameId).delete();

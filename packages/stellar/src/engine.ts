@@ -1,5 +1,6 @@
 import sha3 from "js-sha3";
 const keccak = sha3.keccak256;
+import { poseidon2, poseidon3, poseidon4 } from "poseidon-lite";
 import {
   MAP_W,
   MAP_H,
@@ -9,6 +10,35 @@ import {
   LASER_PENALTY,
 } from "./constants";
 import type { Position } from "./types";
+
+// BN254 scalar field prime
+const BN254_FR_PRIME =
+  21888242871839275222246405745257275088548364400416034343698204186575808495617n;
+
+/** Convert a BigInt field element to a 32-byte big-endian Uint8Array. */
+function fieldToBytes32(n: bigint): Uint8Array {
+  const out = new Uint8Array(32);
+  let tmp = n;
+  for (let i = 31; i >= 0; i--) {
+    out[i] = Number(tmp & 0xffn);
+    tmp >>= 8n;
+  }
+  return out;
+}
+
+/** Convert a 32-byte big-endian Uint8Array to a BigInt field element. */
+function bytes32ToField(b: Uint8Array): bigint {
+  let n = 0n;
+  for (let i = 0; i < 32; i++) {
+    n = (n << 8n) | BigInt(b[i]!);
+  }
+  return n;
+}
+
+/** Represent a signed integer as a BN254 Fr element (negative → prime + value). */
+function intToField(val: bigint): bigint {
+  return val < 0n ? BN254_FR_PRIME + val : val;
+}
 
 export interface Camera {
   x: number;
@@ -130,6 +160,50 @@ export function generateRandomSeed(): Uint8Array {
   return seed;
 }
 
+/**
+ * Derive the initial private position nonce from the shared map seed.
+ * initial_pos_nonce_pN = keccak256(map_seed || player_tag_byte), first byte zeroed.
+ *
+ * Since both players know the map seed (after the relay), they can each
+ * compute BOTH players' initial pos nonces and therefore their initial
+ * pos_commits. This allows begin_match to be called by a single party
+ * with correct values for both players.
+ *
+ * The nonce is used as a BN254 Fr element in Poseidon, so we zero the first
+ * byte to ensure it fits in the field (< 2^248 < Fr.prime).
+ *
+ * Privacy is maintained for SUBSEQUENT turns because each player generates
+ * a fresh random nonce after the first move (via generatePosNonce()).
+ */
+export function deriveInitialPosNonce(
+  mapSeed: Uint8Array,
+  playerTag: 1 | 2,
+): Uint8Array {
+  const data = new Uint8Array(33);
+  data.set(mapSeed, 0);
+  data[32] = playerTag;
+  const h = keccak256(data);
+  h[0] = 0; // ensure fits in BN254 Fr field
+  return h;
+}
+
+/**
+ * Compute the session seed from the session ID and both players' dice seed secrets.
+ * session_seed = keccak256(session_id_BE_u32 || player1_seed_bytes || player2_seed_bytes)
+ * Mirrors derive_session_seed() in engine.rs exactly (session_id is prepended).
+ */
+export function computeSessionSeed(
+  sessionId: number,
+  player1SeedSecret: Uint8Array,
+  player2SeedSecret: Uint8Array,
+): Uint8Array {
+  const data = new Uint8Array(4 + 32 + 32);
+  writeU32BE(data, 0, sessionId);
+  data.set(player1SeedSecret, 4);
+  data.set(player2SeedSecret, 36);
+  return keccak256(data);
+}
+
 /* ------------------------------------------------------------------ */
 /*  ZK Map Secret Relay helpers                                        */
 /* ------------------------------------------------------------------ */
@@ -184,9 +258,10 @@ export function generateMap(mapSeed: Uint8Array): MapData {
   const cameras: Camera[] = [];
   const lasers: Laser[] = [];
 
-  // Place walls (up to 18, skipping spawn-adjacent cells)
+  // Place walls (up to 18, skipping spawn-adjacent cells).
+  // 40 iterations matches the Noir circuit — enough to reliably fill 18 slots.
   let placedWalls = 0;
-  for (let i = 0; i < 80 && placedWalls < 18; i++) {
+  for (let i = 0; i < 40 && placedWalls < 18; i++) {
     const r = seededU32(mapSeed, 1, i);
     const x = r % MAP_W;
     const y = Math.floor(r / MAP_W) % MAP_H;
@@ -199,9 +274,10 @@ export function generateMap(mapSeed: Uint8Array): MapData {
     }
   }
 
-  // Place loot (exactly 24 items)
+  // Place loot (exactly 24 items).
+  // 72 iterations matches the Noir circuit — enough to fill 24 loot slots.
   let placedLoot = 0;
-  for (let j = 0; j < 160 && placedLoot < 24; j++) {
+  for (let j = 0; j < 72 && placedLoot < 24; j++) {
     const r = seededU32(mapSeed, 2, j);
     const x = r % MAP_W;
     const y = Math.floor(r / MAP_W) % MAP_H;
@@ -243,36 +319,39 @@ export function generateMap(mapSeed: Uint8Array): MapData {
 
 /**
  * Serialize map data into bytes for commitment computation.
- * Format (big-endian u32 for all integer fields):
- *   walls (18 bytes) || loot (18 bytes)
- *   || num_cameras (1 byte) || cameras[i]: x(4) y(4) radius(4)
- *   || num_lasers  (1 byte) || lasers[i]:  x1(4) y1(4) x2(4) y2(4)
  *
- * Must match the Noir circuit's keccak preimage exactly.
+ * IMPORTANT: the layout is FIXED at 106 bytes to match the Noir circuit exactly:
+ *   walls(18) || loot(18) || num_cameras(1) || 3×camera(12) || num_lasers(1) || 2×laser(16)
+ *   = 18 + 18 + 1 + 36 + 1 + 32 = 106 bytes
+ *
+ * The circuit always writes all 3 camera slots and both laser slots,
+ * using zeroes for unused slots. We must do the same or the keccak hashes diverge.
  */
 export function serializeMapData(mapData: MapData): Uint8Array {
-  const camBytes = 1 + mapData.cameras.length * 12;
-  const lasBytes = 1 + mapData.lasers.length * 16;
-  const total = 18 + 18 + camBytes + lasBytes;
-  const out = new Uint8Array(total);
+  // Fixed 106-byte buffer, all zeroes by default (matches circuit's zero-padding).
+  const out = new Uint8Array(106);
   let off = 0;
 
   out.set(mapData.walls, off); off += 18;
   out.set(mapData.loot, off); off += 18;
 
+  // num_cameras (1 byte), then always 3 slots of 12 bytes each.
   out[off++] = mapData.cameras.length;
-  for (const cam of mapData.cameras) {
-    writeU32BE(out, off, cam.x); off += 4;
-    writeU32BE(out, off, cam.y); off += 4;
-    writeU32BE(out, off, cam.radius); off += 4;
+  for (let i = 0; i < 3; i++) {
+    const cam = mapData.cameras[i];
+    writeU32BE(out, off, cam ? cam.x : 0); off += 4;
+    writeU32BE(out, off, cam ? cam.y : 0); off += 4;
+    writeU32BE(out, off, cam ? cam.radius : 0); off += 4;
   }
 
+  // num_lasers (1 byte), then always 2 slots of 16 bytes each.
   out[off++] = mapData.lasers.length;
-  for (const laser of mapData.lasers) {
-    writeU32BE(out, off, laser.x1); off += 4;
-    writeU32BE(out, off, laser.y1); off += 4;
-    writeU32BE(out, off, laser.x2); off += 4;
-    writeU32BE(out, off, laser.y2); off += 4;
+  for (let i = 0; i < 2; i++) {
+    const laser = mapData.lasers[i];
+    writeU32BE(out, off, laser ? laser.x1 : 0); off += 4;
+    writeU32BE(out, off, laser ? laser.y1 : 0); off += 4;
+    writeU32BE(out, off, laser ? laser.x2 : 0); off += 4;
+    writeU32BE(out, off, laser ? laser.y2 : 0); off += 4;
   }
 
   return out;
@@ -291,15 +370,41 @@ export function computeMapCommitment(mapData: MapData): Uint8Array {
 /* ------------------------------------------------------------------ */
 
 /**
- * Position commitment: keccak256(x_BE_u32 ‖ y_BE_u32 ‖ nonce_32bytes).
- * Mirrors compute_pos_commit in engine.rs.
+ * Position commitment: Poseidon3(x, y, nonce_fr).
+ * Mirrors compute_pos_commit() in engine.rs and the Circom circuit.
+ *
+ * `nonce` is a 32-byte Uint8Array treated as a BN254 Fr field element
+ * (first byte must be 0 to ensure value < Fr.prime).
  */
 export function computePosCommit(x: number, y: number, nonce: Uint8Array): Uint8Array {
-  const data = new Uint8Array(4 + 4 + 32);
-  writeU32BE(data, 0, x);
-  writeU32BE(data, 4, y);
-  data.set(nonce, 8);
-  return keccak256(data);
+  const nonce_fr = bytes32ToField(nonce);
+  const h = poseidon3([BigInt(x), BigInt(y), nonce_fr]);
+  return fieldToBytes32(h);
+}
+
+/**
+ * Generate a fresh position nonce for Groth16 Poseidon-based commitments.
+ *
+ * In the Groth16 circuit, the new_pos_nonce is NOT constrained by the circuit
+ * (unlike the Noir circuit which enforced keccak derivation).
+ * The client is free to choose any valid BN254 Fr element as the new nonce.
+ *
+ * We generate a random 32-byte value with the first byte zeroed to ensure it
+ * fits within the BN254 scalar field prime (< 2^248 ≪ Fr.prime).
+ */
+export function generatePosNonce(): Uint8Array {
+  const nonce = new Uint8Array(32);
+  crypto.getRandomValues(nonce);
+  nonce[0] = 0; // ensure value < 2^248 < Fr.prime
+  return nonce;
+}
+
+/**
+ * @deprecated Use generatePosNonce() instead.
+ * Kept for compatibility with existing game state — nonces are now random.
+ */
+export function deriveNewPosNonce(_posNonce: Uint8Array, _turnIndex: number): Uint8Array {
+  return generatePosNonce();
 }
 
 /**
@@ -358,72 +463,34 @@ export function rollValue(
 /* ------------------------------------------------------------------ */
 
 /**
- * Compute the single ZK public input hash for a turn.
+ * Compute the single Groth16 ZK public input hash for a turn.
  *
- * The Noir circuit has exactly ONE public input (pi_hash) which is
- * keccak256 of all public turn data, with the first byte zeroed to fit
- * in a BN254 field element (< 2^254).
+ * Formula (mirrors compute_turn_pi_hash() in engine.rs and the Circom circuit):
+ *   h1      = Poseidon4(session_id, turn_index, player_tag, pos_commit_before_fr)
+ *   h2      = Poseidon4(pos_commit_after_fr, score_delta_fr, loot_delta, no_path_flag)
+ *   pi_hash = Poseidon2(h1, h2)
  *
- * The proof_blob submitted to the contract must have:
- *   bytes [0..4]  = 0x00000001 (count = 1 public input)
- *   bytes [4..36] = pi_hash (32 bytes, first byte = 0x00)
- *   bytes [36..]  = proof bytes
- *
- * Mirrors compute_turn_pi_hash() in engine.rs.
+ * score_delta: negative values → BN254 Fr representation (prime + value).
+ * pos_commit values are treated as Fr field elements (first byte = 0).
  */
 export function computeTurnPiHash(
   sessionId: number,
   turnIndex: number,
   playerTag: number,
-  p1MapSeedCommit: Uint8Array,
-  p2MapSeedCommit: Uint8Array,
-  mapCommitment: Uint8Array,
   posCommitBefore: Uint8Array,
   posCommitAfter: Uint8Array,
-  stateCommitBefore: Uint8Array,
-  stateCommitAfter: Uint8Array,
   scoreDelta: bigint,
   lootDelta: number,
   noPathFlag: boolean,
 ): Uint8Array {
-  const out = new Uint8Array(4 + 4 + 4 + 32 + 32 + 32 + 32 + 32 + 32 + 32 + 16 + 4 + 1);
-  let off = 0;
-  writeU32BE(out, off, sessionId); off += 4;
-  writeU32BE(out, off, turnIndex); off += 4;
-  writeU32BE(out, off, playerTag); off += 4;
-  out.set(p1MapSeedCommit, off); off += 32;
-  out.set(p2MapSeedCommit, off); off += 32;
-  out.set(mapCommitment, off); off += 32;
-  out.set(posCommitBefore, off); off += 32;
-  out.set(posCommitAfter, off); off += 32;
-  out.set(stateCommitBefore, off); off += 32;
-  out.set(stateCommitAfter, off); off += 32;
-  writeI128BE(out, off, scoreDelta); off += 16;
-  writeU32BE(out, off, lootDelta); off += 4;
-  out[off] = noPathFlag ? 1 : 0;
+  const pcb = bytes32ToField(posCommitBefore);
+  const pca = bytes32ToField(posCommitAfter);
+  const sd  = intToField(scoreDelta);
 
-  const raw = keccak256(out);
-  // Zero first byte to guarantee the value fits in BN254 field (< 2^254).
-  raw[0] = 0;
-  return raw;
-}
-
-/**
- * Wrap a raw Barretenberg proof with the pi_hash public input header.
- *
- * The resulting bytes are what gets submitted as `proof_blob` to submit_turn().
- * Format: [0x00, 0x00, 0x00, 0x01][pi_hash (32 bytes)][raw_proof_bytes]
- */
-export function wrapProofBlob(piHash: Uint8Array, rawProof: Uint8Array): Uint8Array {
-  const blob = new Uint8Array(4 + 32 + rawProof.length);
-  // count = 1 (big-endian u32)
-  blob[0] = 0x00;
-  blob[1] = 0x00;
-  blob[2] = 0x00;
-  blob[3] = 0x01;
-  blob.set(piHash, 4);
-  blob.set(rawProof, 36);
-  return blob;
+  const h1 = poseidon4([BigInt(sessionId), BigInt(turnIndex), BigInt(playerTag), pcb]);
+  const h2 = poseidon4([pca, sd, BigInt(lootDelta), BigInt(noPathFlag ? 1 : 0)]);
+  const pi = poseidon2([h1, h2]);
+  return fieldToBytes32(pi);
 }
 
 /* ------------------------------------------------------------------ */

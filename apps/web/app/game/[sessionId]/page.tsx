@@ -14,11 +14,10 @@ import { ScorePanel } from "../../../components/ScorePanel";
 import { GameOver } from "../../../components/GameOver";
 import { findPathTo } from "../../../lib/game-engine";
 import { buildTurn } from "../../../lib/turn-builder";
+import { usePrivateStore } from "../../../stores/private-store";
 import {
   existsAnyPathLen,
   makeEffectiveWalls,
-  generateRandomSeed,
-  commitHash,
   type Position,
   HeistContractClient,
 } from "@repo/stellar";
@@ -38,12 +37,6 @@ function isTimerExpiredError(err: unknown): boolean {
   return msg.includes("#16") || msg.toLowerCase().includes("timerexpired");
 }
 
-function bytesToHex(bytes: Uint8Array): string {
-  return Array.from(bytes)
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-}
-
 export default function GamePage({
   params,
 }: {
@@ -53,16 +46,21 @@ export default function GamePage({
   const { address, connected, signTransaction, signAuthEntry } = useWallet();
 
   // Lobby store for join and phase tracking
-  const { lobby, joinLobby, loading: lobbyLoading, error: lobbyError, clearError } = useLobbyStore();
+  const { lobby, joinLobby: joinLobbyStore, loading: lobbyLoading, error: lobbyError, clearError } = useLobbyStore();
 
   // Game hook wires up all polling (lobby, auth, game state)
   const game = useGame(gameId, address ?? undefined, signAuthEntry);
-  const { turnHistory, recordTurn } = useGameStore();
+  const { turnHistory } = useGameStore();
 
   const [selectedPath, setSelectedPath] = useState<Position[]>([]);
   const [submitting, setSubmitting] = useState(false);
+  const [provingStep, setProvingStep] = useState<string | null>(null);
   const [turnError, setTurnError] = useState<string | null>(null);
   const [joining, setJoining] = useState(false);
+
+  const advancePosNonce = usePrivateStore((s) => s.advancePosNonce);
+  const mapSeedReady    = usePrivateStore((s) => !!s.mapSeed);
+  const posNonceReady   = usePrivateStore((s) => !!s.posNonce);
 
   // Reset path when the turn changes
   useEffect(() => {
@@ -78,15 +76,7 @@ export default function GamePage({
     clearError();
 
     try {
-      const seedSecret = generateRandomSeed();
-      const seedCommit = commitHash(seedSecret);
-
-      await joinLobby(
-        gameId,
-        address,
-        bytesToHex(seedCommit),
-        bytesToHex(seedSecret),
-      );
+      await joinLobbyStore(gameId, address);
     } catch {
       // Error stored in lobby store
     } finally {
@@ -95,6 +85,10 @@ export default function GamePage({
   };
 
   // ─── Turn handling ──────────────────────────────────────────────────────────
+
+  // ZK secrets must be ready before allowing turn submission.
+  // mapSeed drives the map rendering; posNonce is needed for ZK proof.
+  const zkSecretsReady = mapSeedReady && posNonceReady;
 
   const isMyTurn =
     game.view?.activePlayer === address && game.view?.status === "Active";
@@ -140,25 +134,41 @@ export default function GamePage({
 
     setSubmitting(true);
     setTurnError(null);
+    setProvingStep("Computing ZK inputs...");
 
     try {
-      const { txXdr, breakdown } = await buildTurn(
+      setProvingStep("Generating ZK proof (this may take a few minutes)...");
+
+      const result = await buildTurn(
         address,
         game.sessionId,
+        gameId,
         game.view,
         game.roll,
         selectedPath,
         game.vkHash,
       );
 
+      const { txXdr, breakdown, newPosNonceHex, turn } = result;
+
+      setProvingStep("Signing transaction...");
       const signedTx = await signTransaction(txXdr);
+
+      setProvingStep("Submitting to blockchain...");
       const client = await createHeistClient();
       await client.submitTx(signedTx);
 
-      recordTurn(breakdown);
+      // Advance pos nonce, position and loot mask now that the turn is confirmed.
+      const endX = breakdown.path[breakdown.path.length - 1]?.x ?? breakdown.path[0]?.x ?? 1;
+      const endY = breakdown.path[breakdown.path.length - 1]?.y ?? breakdown.path[0]?.y ?? 1;
+      advancePosNonce(newPosNonceHex, endX, endY, turn.lootCollectedMaskDelta);
+
+      game.recordTurn(breakdown);
       setSelectedPath([]);
+      setProvingStep(null);
       await game.refreshGameState();
     } catch (err: unknown) {
+      setProvingStep(null);
       if (isTimerExpiredError(err)) {
         await handleTimerExpired();
         return;
@@ -180,25 +190,38 @@ export default function GamePage({
 
     setSubmitting(true);
     setTurnError(null);
+    setProvingStep("Generating ZK proof for skip turn...");
 
     try {
-      const { txXdr, breakdown } = await buildTurn(
+      const result = await buildTurn(
         address,
         game.sessionId,
+        gameId,
         game.view,
         game.roll,
         [startPos],
         game.vkHash,
       );
 
+      const { txXdr, breakdown, newPosNonceHex } = result;
+
+      setProvingStep("Signing transaction...");
       const signedTx = await signTransaction(txXdr);
+
+      setProvingStep("Submitting to blockchain...");
       const client = await createHeistClient();
       await client.submitTx(signedTx);
 
-      recordTurn(breakdown);
+      // Skip turn: position stays at startPos — advance nonce, no loot collected.
+      const sp = game.view!.player1 === address ? game.view!.player1Pos : game.view!.player2Pos;
+      advancePosNonce(newPosNonceHex, sp.x, sp.y);
+
+      game.recordTurn(breakdown);
       setSelectedPath([]);
+      setProvingStep(null);
       await game.refreshGameState();
     } catch (err: unknown) {
+      setProvingStep(null);
       if (isTimerExpiredError(err)) {
         await handleTimerExpired();
         return;
@@ -316,16 +339,36 @@ export default function GamePage({
             <ScorePanel view={game.view} playerAddress={address!} turnHistory={turnHistory} />
             <DiceRoll value={game.roll} isMyTurn={isMyTurn} />
 
+            {!zkSecretsReady && game.view?.status === "Active" && (
+              <div className="rounded-lg bg-yellow-500/10 border border-yellow-500/30 p-3 text-sm text-yellow-400 flex items-center gap-2">
+                <svg className="animate-spin h-4 w-4 flex-shrink-0" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                </svg>
+                <span>ZK secrets loading… map will appear shortly.</span>
+              </div>
+            )}
+
             <TurnControls
-              isMyTurn={isMyTurn}
+              isMyTurn={isMyTurn && zkSecretsReady}
               selectedPath={selectedPath}
               roll={game.roll}
               onSubmit={handleSubmitTurn}
               onSkip={handleSkipTurn}
               onClear={handleClearPath}
               submitting={submitting}
-              canSkip={canSkip}
+              canSkip={canSkip && zkSecretsReady}
             />
+
+            {provingStep && (
+              <div className="rounded-lg bg-heist-green/10 border border-heist-green/30 p-3 text-sm text-heist-green flex items-center gap-2">
+                <svg className="animate-spin h-4 w-4 flex-shrink-0" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                </svg>
+                <span>{provingStep}</span>
+              </div>
+            )}
 
             {turnError && (
               <div className="rounded-lg bg-heist-red/10 border border-heist-red/30 p-3 text-sm text-heist-red">

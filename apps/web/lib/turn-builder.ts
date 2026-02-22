@@ -3,23 +3,88 @@ import {
   buildMockProof,
   countLootInDelta,
   computeScoreDelta,
+  computePosCommit,
+  deriveNewPosNonce,
+  computeStateCommitment,
+  computeTurnPiHash,
+  generateMap,
+  computeLootDelta,
+  computeCameraHits,
+  computeLaserHits,
   zeroBitset,
   CAMERA_PENALTY,
   LASER_PENALTY,
   type Position,
-  type TurnPublic,
   type PlayerGameView,
+  type TurnPublic,
+  type TurnZkPublic,
 } from "@repo/stellar";
 import { getRuntimeConfig } from "./runtime-config";
+import { usePrivateStore } from "../stores/private-store";
 
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001";
 const RPC_URL =
   process.env.NEXT_PUBLIC_SOROBAN_RPC_URL ||
   "https://soroban-testnet.stellar.org";
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function hexToBytes(hex: string): Uint8Array {
+  const clean = hex.startsWith("0x") ? hex.slice(2) : hex;
+  const out = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < clean.length; i += 2) {
+    out[i / 2] = parseInt(clean.slice(i, i + 2), 16);
+  }
+  return out;
+}
+
+/** Encode a signed i128 as 16 bytes big-endian (two's complement). */
+function i128ToBytes(v: bigint): Uint8Array {
+  const out = new Uint8Array(16);
+  let bits = v < 0n ? v + (1n << 128n) : v;
+  for (let i = 15; i >= 0; i--) {
+    out[i] = Number(bits & 0xffn);
+    bits >>= 8n;
+  }
+  return out;
+}
+
+/** Encode an unsigned u64 as 8 bytes big-endian. */
+function u64ToBytes(v: bigint): Uint8Array {
+  const out = new Uint8Array(8);
+  let bits = v;
+  for (let i = 7; i >= 0; i--) {
+    out[i] = Number(bits & 0xffn);
+    bits >>= 8n;
+  }
+  return out;
+}
 
 /** Human-readable path string for logs, e.g. "(2,3)→(3,3)→(4,3)". */
 function formatPath(path: Position[]): string {
   return path.map((p) => `(${p.x},${p.y})`).join("→");
 }
+
+/**
+ * Build a 292-byte mock proof blob matching the Groth16 zk-verifier format.
+ *   [0..4]   n_pub  = 1 (u32 BE)
+ *   [4..36]  pi_hash (the real hash value — verifier reads it from here)
+ *   [36..292] dummy zeros (A, B, C points — pairing will fail but OK for dev)
+ */
+function buildMockProofBlob(piHashBytes: Uint8Array): Uint8Array {
+  const blob = new Uint8Array(292);
+  blob[3] = 1; // n_pub = 1 (big-endian u32)
+  blob.set(piHashBytes.slice(0, 32), 4);
+  return blob;
+}
+
+// ─── Types ───────────────────────────────────────────────────────────────────
 
 /** Score breakdown returned alongside the built turn for UI display. */
 export interface TurnBreakdown {
@@ -36,13 +101,56 @@ export interface TurnBreakdown {
   scoreBefore: bigint;
 }
 
+// ─── ZK proof generation ─────────────────────────────────────────────────────
+
 /**
- * Build a complete TurnPublic, mock proof, and submit_turn transaction.
- * Logs a detailed breakdown to the browser console under a collapsible group.
+ * Call the backend /api/proof/prove endpoint to generate a Groth16 proof.
+ * Returns the 292-byte proof blob as Uint8Array.
+ *
+ * Falls back to a mock blob if the endpoint is unavailable (dev mode).
+ */
+async function generateRealProof(
+  inputs: Record<string, unknown>,
+  piHashBytes: Uint8Array,
+): Promise<Uint8Array> {
+  try {
+    const res = await fetch(`${API_URL}/api/proof/prove`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(inputs),
+      // Groth16 proof generation takes ~1–5 seconds.
+      signal: AbortSignal.timeout(2 * 60 * 1000),
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: "Unknown error" })) as { error?: string };
+      throw new Error(`Proof backend error: ${err.error ?? res.statusText}`);
+    }
+
+    const data = await res.json() as { proofBlobHex?: string };
+    if (!data.proofBlobHex) throw new Error("No proofBlobHex in proof response");
+
+    return hexToBytes(data.proofBlobHex);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("fetch") || msg.includes("network") || msg.includes("connect")) {
+      console.warn("[proof] Backend unavailable — using mock proof blob (dev mode)");
+      return buildMockProofBlob(piHashBytes);
+    }
+    throw err;
+  }
+}
+
+// ─── Main build function ──────────────────────────────────────────────────────
+
+/**
+ * Build a complete turn: compute ZK inputs, generate proof (real or mock),
+ * and build the submit_turn transaction.
  */
 export async function buildTurn(
   playerAddress: string,
   sessionId: number,
+  gameId: string,
   view: PlayerGameView,
   roll: number,
   path: Position[],
@@ -51,137 +159,231 @@ export async function buildTurn(
   turn: TurnPublic;
   proofBlob: Uint8Array;
   txXdr: string;
-  authInfos: import('@repo/stellar').AuthEntryInfo[];
+  authInfos: import("@repo/stellar").AuthEntryInfo[];
   breakdown: TurnBreakdown;
+  /** New position nonce hex — caller must persist via advancePosNonce after tx confirms. */
+  newPosNonceHex: string;
 }> {
   const cfg = await getRuntimeConfig();
   const client = new HeistContractClient(cfg.heistContractId, cfg.rpcUrl || RPC_URL);
-  const isPlayer1 = playerAddress === view.player1;
-  const startPos = isPlayer1 ? view.player1Pos : view.player2Pos;
-  const scoreBefore = isPlayer1 ? view.player1Score : view.player2Score;
-  const noPathFlag = path.length <= 1 && path[0]?.x === startPos.x && path[0]?.y === startPos.y;
 
-  let lootDelta: Uint8Array;
+  const isPlayer1 = playerAddress === view.player1;
+  const startPos  = isPlayer1 ? view.player1Pos : view.player2Pos;
+  const scoreBefore = isPlayer1 ? view.player1Score : view.player2Score;
+  const playerTag   = isPlayer1 ? 1 : 2;
+
+  // ─── Path normalization ─────────────────────────────────────────────────────
+  const noPathFlag =
+    path.length <= 1 &&
+    path[0]?.x === startPos.x &&
+    path[0]?.y === startPos.y;
+
+  let lootDelta:  Uint8Array;
   let cameraHits: number;
-  let laserHits: number;
+  let laserHits:  number;
   let scoreDelta: bigint;
-  let endPos: Position;
-  let fullPath: Position[];
+  let endPos:     Position;
+  let fullPath:   Position[];
 
   if (noPathFlag) {
-    lootDelta = zeroBitset();
+    lootDelta  = zeroBitset();
     cameraHits = 0;
-    laserHits = 0;
+    laserHits  = 0;
     scoreDelta = 0n;
-    endPos = startPos;
-    fullPath = [startPos];
+    endPos     = startPos;
+    fullPath   = [startPos];
   } else {
     fullPath = path;
-    endPos = fullPath[fullPath.length - 1]!;
-    // Fetch loot delta AND hazard hits directly from the contract so we always
-    // use the current on-chain state — never a stale cached view.
-    // • getPathLootDelta: avoids LootAlreadyCollected when loot_collected is stale
-    // • getPathHazards:   covers cameras whose radius reaches the path from outside the fog
-    const [contractLootDelta, hazards] = await Promise.all([
-      client.getPathLootDelta(playerAddress, sessionId, fullPath),
-      client.getPathHazards(playerAddress, sessionId, fullPath),
-    ]);
-    lootDelta = contractLootDelta;
-    const lootPoints = countLootInDelta(lootDelta);
-    cameraHits = hazards.cameraHits;
-    laserHits = hazards.laserHits;
-    scoreDelta = computeScoreDelta(lootPoints, cameraHits, laserHits);
+    endPos   = fullPath[fullPath.length - 1]!;
+
+    lootDelta  = computeLootDelta(view.visibleLoot, view.lootCollected, fullPath);
+    cameraHits = computeCameraHits(fullPath, view.visibleCameras);
+    laserHits  = computeLaserHits(fullPath, view.visibleLasers);
+    scoreDelta = computeScoreDelta(countLootInDelta(lootDelta), cameraHits, laserHits);
   }
 
   const lootItems = countLootInDelta(lootDelta);
 
-  // ─── Score breakdown log ──────────────────────────────────────────────────
+  // ─── Score breakdown log ────────────────────────────────────────────────────
   const sign = (n: bigint) => (n >= 0n ? `+${n}` : `${n}`);
-  const lootPts = BigInt(lootItems);
-  const camPts = BigInt(cameraHits) * CAMERA_PENALTY;
-  const laserPts = BigInt(laserHits) * LASER_PENALTY;
-
   console.group(
     `%c[Turn #${view.turnIndex}] ${playerAddress.slice(0, 6)}… — roll ${roll} — score ${sign(scoreDelta)} pts`,
-    scoreDelta >= 0n
-      ? "color:#4ade80;font-weight:bold"
-      : "color:#f87171;font-weight:bold",
+    scoreDelta >= 0n ? "color:#4ade80;font-weight:bold" : "color:#f87171;font-weight:bold",
   );
   if (noPathFlag) {
     console.log("%cNo move (skip turn) — score unchanged", "color:#9ca3af");
   } else {
+    const lootPts  = BigInt(lootItems);
+    const camPts   = BigInt(cameraHits) * CAMERA_PENALTY;
+    const laserPts = BigInt(laserHits)  * LASER_PENALTY;
     console.log(`Path (${fullPath.length} steps): ${formatPath(fullPath)}`);
-    console.log(
-      `Loot:    ${lootItems} item(s) collected  →  %c${sign(lootPts)} pt(s)`,
-      "color:#fbbf24;font-weight:bold",
-    );
-    console.log(
-      `Cameras: ${cameraHits} hit(s)  (penalty ${CAMERA_PENALTY}/hit)  →  %c-${camPts} pt(s)`,
-      cameraHits > 0 ? "color:#f87171;font-weight:bold" : "color:#9ca3af",
-    );
-    console.log(
-      `Lasers:  ${laserHits} hit(s)  (penalty ${LASER_PENALTY}/hit)  →  %c-${laserPts} pt(s)`,
-      laserHits > 0 ? "color:#f87171;font-weight:bold" : "color:#9ca3af",
-    );
-    console.log(
-      `Formula: ${lootPts} loot - ${camPts} cameras - ${laserPts} lasers = %c${sign(scoreDelta)} pts`,
-      scoreDelta >= 0n ? "color:#4ade80;font-weight:bold" : "color:#f87171;font-weight:bold",
-    );
+    console.log(`Loot:    ${lootItems} item(s) → %c${sign(lootPts)} pt(s)`,   "color:#fbbf24;font-weight:bold");
+    console.log(`Cameras: ${cameraHits} hit(s)  → %c-${camPts} pt(s)`,        cameraHits > 0 ? "color:#f87171;font-weight:bold" : "color:#9ca3af");
+    console.log(`Lasers:  ${laserHits} hit(s)   → %c-${laserPts} pt(s)`,      laserHits  > 0 ? "color:#f87171;font-weight:bold" : "color:#9ca3af");
+    console.log(`Formula: ${lootPts} - ${camPts} - ${laserPts} = %c${sign(scoreDelta)} pts`,
+      scoreDelta >= 0n ? "color:#4ade80;font-weight:bold" : "color:#f87171;font-weight:bold");
   }
   console.log(`Score before: ${scoreBefore}  →  estimated after: ${scoreBefore + scoreDelta}`);
   console.groupEnd();
-  // ─────────────────────────────────────────────────────────────────────────
 
-  const stateHashBefore = await client.getStateHash(playerAddress, sessionId);
+  // ─── Private context ────────────────────────────────────────────────────────
+  const priv = usePrivateStore.getState();
+  if (priv.gameId !== gameId) {
+    throw new Error(
+      "Private game context mismatch for this tab. Please reload this game page.",
+    );
+  }
+  if (!priv.posNonce) {
+    throw new Error("Position nonce not initialised. Please complete the lobby setup.");
+  }
+  if (!priv.sessionSeed) {
+    throw new Error("Session seed not available. Please complete the lobby setup.");
+  }
 
-  const partialTurn: TurnPublic = {
+  const posNonceBytes    = hexToBytes(priv.posNonce);
+  const sessionSeedBytes = hexToBytes(priv.sessionSeed);
+
+  const actualStartPos = { x: priv.posX, y: priv.posY };
+
+  // ─── ZK commitment computation ──────────────────────────────────────────────
+  const posCommitBefore = computePosCommit(actualStartPos.x, actualStartPos.y, posNonceBytes);
+
+  // Groth16 circuit does NOT constrain new_pos_nonce derivation — any valid
+  // BN254 Fr element works. deriveNewPosNonce() now returns a fresh random nonce.
+  const newPosNonce    = deriveNewPosNonce(posNonceBytes, view.turnIndex);
+  const posCommitAfter = computePosCommit(endPos.x, endPos.y, newPosNonce);
+
+  // State commitments are still verified on-chain by the heist contract (Keccak,
+  // not part of the ZK circuit), so we still compute and submit them.
+  const stateCommitBefore = await client.getStateCommitment(playerAddress, sessionId);
+
+  const deadlineTs      = BigInt(view.deadlineTs ?? 0);
+  const deadlineTsBytes = u64ToBytes(deadlineTs);
+  const activeScore     = isPlayer1 ? view.player1Score : view.player2Score;
+  const newActiveScore  = activeScore + scoreDelta;
+
+  const otherPosCommit = isPlayer1 ? view.player2PosCommit : view.player1PosCommit;
+  const newP1PosCommit = isPlayer1 ? posCommitAfter : otherPosCommit;
+  const newP2PosCommit = isPlayer1 ? otherPosCommit : posCommitAfter;
+  const newP1Score     = isPlayer1 ? newActiveScore : view.player1Score;
+  const newP2Score     = isPlayer1 ? view.player2Score : newActiveScore;
+
+  const stateCommitAfter = computeStateCommitment(
     sessionId,
-    turnIndex: view.turnIndex,
-    player: playerAddress,
-    startPos,
-    endPos,
-    rolledValue: roll,
+    view.turnIndex + 1,
+    newP1Score,
+    newP2Score,
+    view.mapCommitment,
+    newP1PosCommit,
+    newP2PosCommit,
+    sessionSeedBytes,
+    deadlineTs,
+  );
+
+  // ─── pi_hash (Groth16 public input) ─────────────────────────────────────────
+  // Poseidon2(
+  //   Poseidon4(session_id, turn_index, player_tag, pos_commit_before),
+  //   Poseidon4(pos_commit_after, score_delta_fr, loot_delta, no_path_flag)
+  // )
+  const piHashBytes = computeTurnPiHash(
+    sessionId,
+    view.turnIndex,
+    playerTag,
+    posCommitBefore,
+    posCommitAfter,
     scoreDelta,
-    cameraHits,
-    laserHits,
-    lootCollectedMaskDelta: lootDelta,
+    lootItems,
     noPathFlag,
-    stateHashBefore,
-    stateHashAfter: new Uint8Array(32),
-    path: fullPath,
-  };
+  );
 
-  const stateHashAfter = await client.simulateStateHashAfter(
-    playerAddress,
+  // ─── Groth16 circuit inputs ─────────────────────────────────────────────────
+  if (!priv.mapSeed) {
+    throw new Error(
+      "Map seed missing. The ZK relay did not complete. " +
+      "Please reload the page and wait for the relay to finish.",
+    );
+  }
+  const mapData = generateMap(hexToBytes(priv.mapSeed));
+
+  // Remove already-collected loot from the map before passing to the circuit.
+  // The circuit counts "loot cells along path" in map_loot, and lootDelta is the
+  // count of UNCOLLECTED loot (via computeLootDelta). Passing raw mapData.loot would
+  // include already-taken items and cause the circuit constraint to fail after the
+  // first collected loot.
+  const availableLoot = new Uint8Array(mapData.loot.length);
+  for (let i = 0; i < availableLoot.length; i++) {
+    availableLoot[i] = (mapData.loot[i] ?? 0) & ~(view.lootCollected[i] ?? 0);
+  }
+
+  const pathX = fullPath.map((p) => p.x);
+  const pathY = fullPath.map((p) => p.y);
+  while (pathX.length < 7) pathX.push(pathX[pathX.length - 1] ?? endPos.x);
+  while (pathY.length < 7) pathY.push(pathY[pathY.length - 1] ?? endPos.y);
+  const moveCount = Math.max(0, fullPath.length - 1);
+
+  const proofInputs = {
+    mapWalls:   bytesToHex(mapData.walls),
+    mapLoot:    bytesToHex(availableLoot),
+    posX:       actualStartPos.x,
+    posY:       actualStartPos.y,
+    posNonce:   bytesToHex(posNonceBytes),
+    pathX,
+    pathY,
+    pathLen:    noPathFlag ? 0 : Math.min(moveCount, 6),
+    newPosNonce: bytesToHex(newPosNonce),
     sessionId,
-    partialTurn,
-  );
-
-  const finalTurn: TurnPublic = {
-    ...partialTurn,
-    stateHashAfter,
+    turnIndex:  view.turnIndex,
+    playerTag,
+    scoreDelta: Number(scoreDelta),
+    lootDelta:  lootItems,
+    noPathFlag: noPathFlag ? 1 : 0,
+    // Optional hints for backend logging
+    posCommitBefore: bytesToHex(posCommitBefore),
+    posCommitAfter:  bytesToHex(posCommitAfter),
   };
 
-  const publicInputsHash = await client.hashTurnPublic(
-    playerAddress,
-    finalTurn,
-  );
+  console.log("[proof] Requesting Groth16 proof from backend...");
+  const proofBlob = await generateRealProof(proofInputs, piHashBytes);
+  console.log(`[proof] Proof blob: ${proofBlob.length} bytes`);
 
-  const proofBlob = buildMockProof(vkHash, publicInputsHash);
+  // ─── Build on-chain turn data ───────────────────────────────────────────────
+  const zkTurn: TurnZkPublic = {
+    sessionId,
+    turnIndex:        view.turnIndex,
+    player:           playerAddress,
+    scoreDelta,
+    lootDelta:        lootItems,
+    posCommitBefore,
+    posCommitAfter,
+    stateCommitBefore,
+    stateCommitAfter,
+    noPathFlag,
+  };
 
   const { txXdr, authInfos } = await client.buildSubmitTurnTx(
     playerAddress,
     sessionId,
     playerAddress,
     proofBlob,
-    finalTurn,
+    zkTurn,
   );
 
-  const breakdown: TurnBreakdown = {
-    turnIndex: view.turnIndex,
-    player: playerAddress,
-    noPathFlag,
+  const finalTurn: TurnPublic = {
+    ...zkTurn,
+    startPos,
+    endPos,
+    rolledValue: roll,
+    cameraHits,
+    laserHits,
+    lootCollectedMaskDelta: lootDelta,
     path: fullPath,
+  };
+
+  const breakdown: TurnBreakdown = {
+    turnIndex:  view.turnIndex,
+    player:     playerAddress,
+    noPathFlag,
+    path:       fullPath,
     lootItems,
     cameraHits,
     laserHits,
@@ -189,5 +391,15 @@ export async function buildTurn(
     scoreBefore,
   };
 
-  return { turn: finalTurn, proofBlob, txXdr, authInfos, breakdown };
+  return {
+    turn:           finalTurn,
+    proofBlob,
+    txXdr,
+    authInfos,
+    breakdown,
+    newPosNonceHex: bytesToHex(newPosNonce),
+  };
 }
+
+// Keep for backward compatibility with any callers that pass vkHash as 3rd arg.
+export { buildMockProof };

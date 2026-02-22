@@ -202,29 +202,19 @@ This creates a **cryptographic chain** between turns — like a blockchain withi
 
 ## Remaining Improvements
 
-### 1. Frontend proof generation (critical for full playability)
+### 1. Frontend proof generation
 
-**Current state**: The Noir circuit (`apps/circuits/turn_validity`) is compiled and the verification key is deployed on-chain. The TypeScript client (`packages/stellar/src/engine.ts`) has all commitment computation helpers. However, the frontend (`apps/web`) does not yet integrate `@noir-lang/noir_js` and `@aztec/bb.js` to actually generate proofs in-browser.
+**Current state**: Fully implemented. The proof generation pipeline is:
 
-**Impact**: Without proof generation, the game loop cannot complete. Players can commit to seeds and begin a match, but `submit_turn` will fail without a valid proof.
+1. **Private store** (`apps/web/stores/private-store.ts`) — holds map secrets, session seed, and position nonce locally in the browser.
+2. **Lobby store** (`apps/web/stores/lobby-store.ts`) — generates dice and map seed secrets at create/join, sends commitments to the backend.
+3. **Relay phase handler** (`apps/web/lib/use-game.ts`) — when the lobby enters `relaying`, automatically exchanges map secrets, derives `mapSeed`, derives initial position nonces from `mapSeed` (so both players independently compute identical initial pos commits), and calls `begin-match`. Stores `sessionSeed` (returned by the backend) and `posNonce` in the private store.
+4. **Turn builder** (`apps/web/lib/turn-builder.ts`) — computes all ZK inputs from local state, calls `POST /api/proof/prove` on the backend, wraps the raw proof with `wrapProofBlob`, and builds the `submit_turn` transaction.
+5. **Proof endpoint** (`apps/api/src/proof/proof.service.ts`, `proof.controller.ts`) — `POST /api/proof/prove` receives all private + public inputs, writes a `Prover.toml`, runs `nargo execute` (witness) + `bb prove` (proof), and returns raw proof bytes.
 
-**Fix**:
-```typescript
-import { Noir } from '@noir-lang/noir_js';
-import { UltraHonkBackend } from '@aztec/bb.js';
-import circuit from '../circuits/turn_validity/target/turn_validity.json';
+**Performance**: Proof generation takes 2-5 minutes for this circuit (80 wall + 160 loot Keccak iterations). The frontend shows a live status indicator. The backend falls back gracefully to a mock proof if the binaries are not available (dev mode).
 
-async function generateTurnProof(privateInputs: TurnPrivateInputs) {
-    const backend = new UltraHonkBackend(circuit.bytecode);
-    const noir = new Noir(circuit);
-
-    const { witness } = await noir.execute(privateInputs);
-    const { proof, publicInputs } = await backend.generateProof(witness);
-    return wrapProofBlob(proof, publicInputs[0]); // pi_hash
-}
-```
-
-Note: Proof generation for this circuit takes several minutes due to its size (80 wall + 160 loot Keccak iterations). For production, this should be offloaded to a backend worker. For the demo, a pre-generated proof can illustrate the flow.
+**Binary configuration**: Set `NARGO_PATH` and `BB_PATH` env vars on the API server (defaults to `~/.nargo/bin/nargo` and `~/.bb/bb`). Use the existing `docker_gen_vk.sh` as a reference for installing the correct Barretenberg version.
 
 ---
 

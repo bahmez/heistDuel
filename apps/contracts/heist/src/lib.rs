@@ -8,7 +8,7 @@ use soroban_sdk::{
 };
 
 use engine::{
-    commit_hash, compute_state_commitment, compute_turn_pi_hash,
+    commit_hash, compute_pos_commit, compute_state_commitment, compute_turn_pi_hash,
     derive_session_seed, roll_value, GAME_SECONDS, LOOT_COUNT,
 };
 
@@ -376,21 +376,18 @@ impl HeistContract {
         Ok(())
     }
 
-    /// Verifies a ZK turn proof and applies the proven state transition.
+    /// Verifies a Groth16 ZK turn proof and applies the proven state transition.
     ///
-    /// The ZK circuit proves (privately):
-    ///   - Both map_secrets match their on-chain commitments
-    ///   - map_seed = keccak(secret1 XOR secret2), map_data = generate_map(map_seed)
-    ///   - keccak(map_data) == map_commitment (on-chain)
-    ///   - Position commitment is valid and transitions correctly
-    ///   - Dice roll is correctly derived from session_seed + turn_index
-    ///   - Path is valid (no wall crossing, correct length)
-    ///   - score_delta and loot_delta are correctly computed from path
-    ///   - State commitment transitions correctly
+    /// The Circom circuit proves (privately, over BN254 with Poseidon):
+    ///   - pos_commit_before = Poseidon3(pos_x, pos_y, pos_nonce)
+    ///   - pos_commit_after  = Poseidon3(end_x, end_y, new_nonce)
+    ///   - Path is valid (adjacency, bounds, no walls)
+    ///   - loot_delta is correctly computed from the path
+    ///   - score_delta = loot_delta − camera_hits − laser_hits * 2
     ///
-    /// The single public input to the circuit is pi_hash = keccak(all TurnZkPublic fields),
-    /// embedded as proof_blob[4..36]. The contract verifies this binding before
-    /// calling the ZK verifier.
+    /// The single public input is pi_hash (Poseidon-based), embedded at
+    /// proof_blob[4..36]. The contract verifies this binding before calling
+    /// the Groth16 verifier.
     pub fn submit_turn(
         env: Env,
         session_id: u32,
@@ -418,9 +415,8 @@ impl HeistContract {
             return Err(Error::InvalidTurnData);
         }
 
-        // Proof blob must be present and large enough:
-        // [4-byte count=1][32-byte pi_hash][proof bytes (≥ 440*32 bytes)]
-        if proof_blob.len() < 36 {
+        // Groth16 proof blob: [4 n_pub=1][32 pi_hash][64 pi_a][128 pi_b][64 pi_c] = 292 bytes
+        if proof_blob.len() < 292 {
             return Err(Error::ProofRequired);
         }
 
@@ -441,20 +437,19 @@ impl HeistContract {
 
         let player_tag: u32 = if player == game.player1 { 1 } else { 2 };
 
-        // Compute the expected pi_hash from TurnZkPublic fields.
-        // The Noir circuit must compute this identically as its single public input.
+        // Compute the expected pi_hash from public turn data.
+        // The Circom circuit must compute this identically as its single public input.
+        // Formula: Poseidon2(
+        //   Poseidon4(session_id, turn_index, player_tag, pos_commit_before),
+        //   Poseidon4(pos_commit_after, score_delta_fr, loot_delta, no_path_flag)
+        // )
         let expected_pi = compute_turn_pi_hash(
             &env,
             session_id,
             game.turn_index,
             player_tag,
-            &game.p1_map_seed_commit,
-            &game.p2_map_seed_commit,
-            &game.map_commitment,
             &public_turn.pos_commit_before,
             &public_turn.pos_commit_after,
-            &public_turn.state_commit_before,
-            &public_turn.state_commit_after,
             public_turn.score_delta,
             public_turn.loot_delta,
             public_turn.no_path_flag,
@@ -625,8 +620,8 @@ impl HeistContract {
         Ok(roll_value(&env, session_seed, game.turn_index, player_tag))
     }
 
-    /// Returns the pi_hash that the Noir circuit must produce as its public input
-    /// for a given TurnZkPublic. Useful for client-side proof construction validation.
+    /// Returns the pi_hash that the Circom circuit must produce as its public input.
+    /// Useful for client-side proof construction validation.
     pub fn compute_pi_hash(env: Env, session_id: u32, public_turn: TurnZkPublic) -> Result<BytesN<32>, Error> {
         let game = Self::require_game(&env, session_id)?;
         let player_tag: u32 = if public_turn.player == game.player1 { 1 } else { 2 };
@@ -635,17 +630,18 @@ impl HeistContract {
             session_id,
             public_turn.turn_index,
             player_tag,
-            &game.p1_map_seed_commit,
-            &game.p2_map_seed_commit,
-            &game.map_commitment,
             &public_turn.pos_commit_before,
             &public_turn.pos_commit_after,
-            &public_turn.state_commit_before,
-            &public_turn.state_commit_after,
             public_turn.score_delta,
             public_turn.loot_delta,
             public_turn.no_path_flag,
         ))
+    }
+
+    /// Returns the Poseidon-based position commitment for the given (x, y, nonce).
+    /// Mirrors the Circom circuit's pos_commit computation.
+    pub fn compute_pos_commit_view(env: Env, x: u32, y: u32, nonce: BytesN<32>) -> BytesN<32> {
+        compute_pos_commit(&env, x, y, &nonce)
     }
 
     pub fn get_admin(env: Env) -> Address {

@@ -101,6 +101,23 @@ export class LobbyService {
     return this.store.onSnapshot(gameId, callback);
   }
 
+  /**
+   * Atomically claim the 'beginning' phase using a Firestore transaction.
+   * Returns true if this caller should run the begin_match tx (won the race).
+   * Returns false if another caller already claimed it.
+   */
+  async atomicClaimBeginning(gameId: string): Promise<boolean> {
+    return this.store.atomicClaimBeginning(gameId);
+  }
+
+  /**
+   * Poll until sessionSeed is available (set by the winner of the atomic race).
+   * Used by the second player who must wait for the first player's tx to complete.
+   */
+  async waitForSessionSeed(gameId: string, timeoutMs?: number): Promise<string | null> {
+    return this.store.waitForSessionSeed(gameId, timeoutMs);
+  }
+
   async delete(gameId: string): Promise<void> {
     return this.store.delete(gameId);
   }

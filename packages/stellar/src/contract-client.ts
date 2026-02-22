@@ -9,6 +9,7 @@ import {
   Keypair,
 } from "@stellar/stellar-sdk";
 import type { TurnZkPublic, GameView } from "./types";
+export type { GameView } from "./types";
 import { NETWORK_PASSPHRASE } from "./constants";
 
 /**
@@ -261,6 +262,23 @@ export class HeistContractClient {
     const result = sim.result;
     if (!result) throw new Error("No simulation result");
     return result.retval;
+  }
+
+  /**
+   * Get the full game view (requires admin/backend source address since get_game
+   * uses require_auth with the admin account).
+   * In Soroban simulation, if source == admin address, require_auth() passes automatically.
+   */
+  async getGameView(
+    adminAddress: string,
+    sessionId: number,
+  ): Promise<GameView> {
+    const retval = await this.simulateCall(
+      adminAddress,
+      "get_game",
+      u32Val(sessionId),
+    );
+    return parseGameView(retval);
   }
 
   async getStateCommitment(

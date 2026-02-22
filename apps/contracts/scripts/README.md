@@ -1,63 +1,85 @@
-# Deployment Script
+# Contract Scripts
 
-Script: `apps/contracts/scripts/deploy.ps1`
+This folder contains deployment and deployment-sync utilities for Soroban contracts.
 
-## But
+## Scripts
 
-Deployer automatiquement les 2 contrats Soroban:
+### `deploy.ts` (recommended)
 
-1. `zk-verifier`
-2. `heist` (avec l'adresse du `zk-verifier` deploye)
+Cross-platform deployment script used by default.
 
-avec selection de reseau `testnet` ou `mainnet`.
+- Builds `zk-verifier` and `heist` (unless `--skip-build`).
+- Deploys both contracts, or upgrades an existing `heist` contract.
+- Uploads Groth16 VK to `zk-verifier` (unless `--skip-vk`).
+- Writes outputs to JSON and Firestore.
+- Updates local `.env` files and shared constants for convenience.
 
-## Prerequis
+Run from `apps/contracts`:
 
-- `stellar` CLI installe et configure.
-- `cargo` installe.
-- target Rust WASM:
-  - `rustup target add wasm32-unknown-unknown`
-- Un `GameHub` deja deploye (adresse `C...`).
-- Une identite source configuree (`stellar keys ls`).
-
-## Usage
-
-Depuis la racine du repo:
-
-```powershell
-.\apps\contracts\scripts\deploy.ps1 -Network testnet -Source alice -GameHub CABC...
+```bash
+pnpm deploy -- --network testnet --source <source> --game-hub <game-hub-id>
 ```
 
-Avec admin explicite:
+### `seed-deployment.ts`
 
-```powershell
-.\apps\contracts\scripts\deploy.ps1 -Network mainnet -Source prod -Admin GABC... -GameHub CDEF...
+Writes a deployment record to Firestore when contracts were deployed/updated manually.
+
+```bash
+npx tsx scripts/seed-deployment.ts --network testnet
 ```
 
-Si les WASM sont deja build:
+### `deploy.ps1` (legacy)
 
-```powershell
-.\apps\contracts\scripts\deploy.ps1 -Network testnet -Source alice -GameHub CABC... -SkipBuild
+PowerShell deployment script retained for compatibility. Prefer `deploy.ts` for new workflows.
+
+### `init-vk.ps1` (legacy)
+
+Helper script for VK initialization in older workflows.
+
+## `deploy.ts` options
+
+| Option | Default | Description |
+|---|---|---|
+| `--network` | `testnet` | Target network (`testnet` or `mainnet`) |
+| `--source` | `heist-testnet-deployer` | Stellar key alias or secret used to sign txs |
+| `--game-hub` | built-in default | GameHub contract ID |
+| `--admin` | source address | Admin address for contract constructors |
+| `--rust-toolchain` | `1.90.0` | Rust toolchain used for `stellar contract build` |
+| `--skip-build` | `false` | Skip Rust build and reuse existing WASM artifacts |
+| `--skip-vk` | `false` | Skip `set_vk` call on `zk-verifier` |
+| `--vk-file` | `apps/circuits/turn_validity_g16/build/vk.bin` | VK binary file (or directory containing `vk.bin`) |
+| `--upgrade-heist-id` | empty | Upgrade an existing heist contract in-place |
+| `--update-vk-id` | empty | Update VK on an existing verifier and exit |
+| `--env-file` | `apps/api/.env` | Extra env file (Firebase credentials/config) |
+
+## VK source resolution
+
+`deploy.ts` resolves VK in this order:
+
+1. `--vk-file` value (if provided)
+2. `apps/circuits/turn_validity_g16/build/vk.bin`
+3. Placeholder bytes (for local/dev fallback, with warning logs)
+
+Generate a real VK from the circuit workspace:
+
+```bash
+cd apps/circuits/turn_validity_g16
+npm install
+npm run compile
+npm run setup
 ```
 
-## Parametres
+## Outputs
 
-- `-Network`: `testnet` ou `mainnet` (defaut: `testnet`)
-- `-Source`: identite/compte source pour signer les tx de deploy
-- `-GameHub`: identite ou adresse du contrat GameHub
-- `-Admin`: identite ou adresse admin (defaut: adresse derivee de `-Source`)
-- `-RustToolchain`: toolchain rustup pour le build Soroban (defaut: `1.90.0-x86_64-pc-windows-msvc`)
-- `-SkipBuild`: saute la phase de build WASM
-
-## Output
-
-Le script ecrit un fichier:
+### Local JSON record
 
 - `apps/contracts/deployments/<network>.json`
 
-avec:
+Contains addresses, VK hash, mode (`full` / `upgrade`), and metadata.
 
-- `zk_verifier_id`
-- `heist_id`
-- `network`, `source`, `admin`, `game_hub`
-- timestamp UTC
+### Firestore record (if configured)
+
+- Collection: `deployments`
+- Document ID: deployment timestamp (`ISO8601`)
+
+The API loads active addresses from these deployment records on restart.

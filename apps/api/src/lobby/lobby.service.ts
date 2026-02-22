@@ -5,8 +5,8 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { authorizeEntry, xdr } from '@stellar/stellar-sdk';
-import { createHash } from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
+import { computeSessionSeed, keccak256 } from '@repo/stellar';
 import { LobbyService as DbLobbyService } from '@repo/database';
 import type {
   LobbyDocument,
@@ -20,6 +20,20 @@ import type { AuthEntryInfo } from '@repo/stellar';
 
 const SIGN_TIMEOUT_MS = 120_000;
 const SIM_RETRY_ATTEMPTS = 8;
+
+function serializeBigInt(value: unknown): unknown {
+  if (typeof value === 'bigint') return value.toString();
+  // Uint8Array / Buffer → plain number array for clean JSON serialization.
+  // Must come before the generic object branch because Uint8Array is typeof 'object'.
+  if (value instanceof Uint8Array) return Array.from(value);
+  if (Array.isArray(value)) return value.map(serializeBigInt);
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, serializeBigInt(v)]),
+    );
+  }
+  return value;
+}
 const SIM_RETRY_DELAY_MS = 2_000;
 const SIM_RETRY_ATTEMPTS_EXTENDED = 25;
 const SIM_RETRY_DELAY_MS_EXTENDED = 5_000;
@@ -147,6 +161,27 @@ export class LobbyService {
     return this.sanitize(lobby);
   }
 
+  /**
+   * Fetch the game state from the contract using the backend admin key.
+   * get_game() requires admin auth; the backend source keypair IS the admin.
+   * During Soroban simulation, require_auth() passes when source == admin.
+   */
+  async getGameState(gameId: string) {
+    const lobby = await this.dbLobby.findByIdOrThrow(gameId);
+    if (!lobby.sessionId) {
+      throw new BadRequestException('Game has not started yet');
+    }
+    const client = this.stellar.getClient();
+    const adminAddress = this.stellar.getSourceAddress();
+    try {
+      const view = await client.getGameView(adminAddress, lobby.sessionId);
+      return serializeBigInt(view);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new BadRequestException(`Failed to fetch game state: ${msg}`);
+    }
+  }
+
   subscribeToLobby(
     gameId: string,
     callback: (view: LobbyPublicView) => void,
@@ -190,9 +225,12 @@ export class LobbyService {
   ): Promise<MapSecretRelayResult> {
     const lobby = await this.dbLobby.findByIdOrThrow(gameId);
 
-    if (lobby.phase !== 'relaying') {
+    // Allow relay in 'relaying' or any subsequent phase so players can recover
+    // their shared mapSeed after a page refresh (the secrets never change).
+    const allowedPhases = ['relaying', 'beginning', 'active'];
+    if (!allowedPhases.includes(lobby.phase)) {
       throw new BadRequestException(
-        `Cannot relay map secret in phase '${lobby.phase}'. Wait until phase is 'relaying'.`,
+        `Cannot relay map secret in phase '${lobby.phase}'. Must be in relaying, beginning, or active phase.`,
       );
     }
 
@@ -336,16 +374,42 @@ export class LobbyService {
   /**
    * Called by a player after they have exchanged map secrets and computed
    * map_commitment, p1_pos_commit, p2_pos_commit locally.
-   * Both players must submit the same map_commitment for begin_match to succeed.
+   *
+   * This endpoint is IDEMPOTENT: if a second player calls it while the first is
+   * already in 'beginning' or 'active' phase, we return the stored sessionSeed
+   * immediately without re-running the on-chain transaction.
    */
   async handleBeginMatch(
     gameId: string,
     mapCommitment: string,
     p1PosCommit: string,
     p2PosCommit: string,
-  ): Promise<void> {
-    await this.dbLobby.update(gameId, { phase: 'beginning' });
-    this.logger.log(`[${gameId}] Phase → beginning`);
+  ): Promise<{ sessionSeed: string }> {
+    // Fast-path: already active with a cached seed.
+    const existing = await this.dbLobby.findByIdOrThrow(gameId);
+    if (existing.sessionSeed) {
+      this.logger.log(`[${gameId}] begin-match — returning cached sessionSeed (phase=${existing.phase})`);
+      return { sessionSeed: existing.sessionSeed };
+    }
+
+    // Atomic claim: only ONE caller transitions 'relaying' → 'beginning'.
+    // Any concurrent call that loses the race will wait for the winner's result.
+    const claimed = await this.dbLobby.atomicClaimBeginning(gameId);
+
+    if (!claimed) {
+      // Another caller is running (or has finished) the begin_match tx.
+      this.logger.log(`[${gameId}] begin-match — lost atomic race, waiting for sessionSeed…`);
+      const seed = await this.dbLobby.waitForSessionSeed(gameId);
+      if (seed) return { sessionSeed: seed };
+
+      // If waitForSessionSeed returned null the winner tx may have failed.
+      // Re-check the lobby phase for a helpful error message.
+      const cur = await this.dbLobby.findByIdOrThrow(gameId);
+      if (cur.sessionSeed) return { sessionSeed: cur.sessionSeed };
+      throw new Error(cur.error ?? 'begin_match tx failed (other caller)');
+    }
+
+    this.logger.log(`[${gameId}] Phase → beginning (claimed atomic lock)`);
 
     const lobby = await this.dbLobby.findByIdOrThrow(gameId);
     const client = this.stellar.getClient();
@@ -368,18 +432,31 @@ export class LobbyService {
       const result = await this.signAllAndSubmit(gameId, 'begin_match', txXdr, authInfos);
       this.logger.log(`[begin_match] Confirmed: ${result.hash}`);
 
-      // Clear map secrets now that they are no longer needed.
+      // Compute session_seed = keccak256(p1SeedSecret || p2SeedSecret).
+      // Mirrors begin_match() on-chain so clients can reproduce locally for ZK.
+      const sessionSeedBytes = computeSessionSeed(
+        lobby.sessionId,
+        new Uint8Array(Buffer.from(lobby.player1SeedSecret!, 'hex')),
+        new Uint8Array(Buffer.from(lobby.player2SeedSecret!, 'hex')),
+      );
+      const sessionSeed = Buffer.from(sessionSeedBytes).toString('hex');
+
+      // Persist sessionSeed and advance phase.
+      // Map seed secrets are retained so players can re-derive mapSeed after
+      // a page refresh (recovery via POST /map-secret in 'active' phase).
       await this.dbLobby.update(gameId, {
         phase: 'active',
-        player1MapSeedSecret: null,
-        player2MapSeedSecret: null,
+        sessionSeed,
       });
-      this.logger.log(`[${gameId}] Phase → active (map secrets cleared)`);
+      this.logger.log(`[${gameId}] Phase → active (sessionSeed cached)`);
+
+      return { sessionSeed };
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       const stack = err instanceof Error ? err.stack : undefined;
       this.logger.error(`[begin_match] Failed: ${msg}`, stack);
       await this.dbLobby.update(gameId, { phase: 'error', error: msg });
+      throw err;
     }
   }
 
@@ -506,10 +583,10 @@ export class LobbyService {
     };
   }
 
-  /** Compute keccak256 of a hex string and return as hex. */
+  /** Compute keccak256 of a hex-encoded byte string and return as hex. */
   private keccakHex(hexInput: string): string {
-    const bytes = Buffer.from(hexInput, 'hex');
-    return createHash('sha3-256').update(bytes).digest('hex');
+    const bytes = new Uint8Array(Buffer.from(hexInput, 'hex'));
+    return Buffer.from(keccak256(bytes)).toString('hex');
   }
 
   private isRetriableSimulationError(msg: string): boolean {

@@ -1,0 +1,20 @@
+[package]
+name = "zk-verifier-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+soroban-sdk = { version = "25.1.1", default-features = false, features = ["alloc"] }
+ultrahonk_soroban_verifier = { path = "../ultrahonk-rust-verifier/ultrahonk-soroban-verifier", default-features = false, features = ["alloc"], optional = true }
+
+[dev-dependencies]
+soroban-sdk = { version = "25.1.1", features = ["testutils"] }
+
+[features]
+default = []
+real-verifier = [
+  "dep:ultrahonk_soroban_verifier",
+]

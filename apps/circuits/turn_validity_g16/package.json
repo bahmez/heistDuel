@@ -1,0 +1,16 @@
+{
+  "name": "turn_validity_g16",
+  "version": "1.0.0",
+  "description": "Groth16 ZK circuit for HeistDuel turn validity (Poseidon over BN254)",
+  "scripts": {
+    "install-deps": "npm install",
+    "compile": "circom turn_validity.circom --r1cs --wasm --sym --output build/",
+    "setup": "node scripts/setup.mjs",
+    "export-vk": "node scripts/export-vk.mjs",
+    "test-prove": "node scripts/test-prove.mjs"
+  },
+  "dependencies": {
+    "circomlib": "^2.0.5",
+    "snarkjs": "^0.7.5"
+  }
+}

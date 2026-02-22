@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { FirebaseModule } from '@repo/firebase';
 import { LobbyModule } from './lobby/lobby.module';
 import { StellarModule } from './stellar/stellar.module';
+import { ProofModule } from './proof/proof.module';
 
 /**
  * Root application module.
@@ -28,6 +29,7 @@ import { StellarModule } from './stellar/stellar.module';
 
     // Feature modules
     LobbyModule,
+    ProofModule,
   ],
 })
 export class AppModule {}

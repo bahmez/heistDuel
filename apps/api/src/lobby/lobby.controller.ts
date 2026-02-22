@@ -98,6 +98,17 @@ export class LobbyController {
     return this.lobbyService.getLobbyPublicView(gameId);
   }
 
+  /**
+   * GET /api/lobby/:gameId/game-state
+   *
+   * Returns the full on-chain game state (GameView) for a session.
+   * Uses the backend admin keypair to satisfy get_game()'s require_auth constraint.
+   */
+  @Get(':gameId/game-state')
+  async getGameState(@Param('gameId') gameId: string) {
+    return this.lobbyService.getGameState(gameId);
+  }
+
   @Sse(':gameId/events')
   streamLobbyEvents(
     @Param('gameId') gameId: string,
@@ -181,12 +192,12 @@ export class LobbyController {
     @Param('gameId') gameId: string,
     @Body() dto: BeginMatchDto,
   ) {
-    await this.lobbyService.handleBeginMatch(
+    const { sessionSeed } = await this.lobbyService.handleBeginMatch(
       gameId,
       dto.mapCommitment,
       dto.p1PosCommit,
       dto.p2PosCommit,
     );
-    return { ok: true };
+    return { ok: true, sessionSeed };
   }
 }

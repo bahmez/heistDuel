@@ -82,11 +82,23 @@ function killProcessTree(pid) {
 killStaleApiWatchers();
 killPort(PORT);
 
+// UltraHonk proof generation requires 4-8 GB of RAM. Node.js defaults to ~1.5 GB
+// which causes a WASM `unreachable` OOM crash. Bump the heap limit via NODE_OPTIONS
+// so the bb.js WASM allocator has enough room.
+const env = {
+  ...process.env,
+  NODE_OPTIONS: [
+    process.env.NODE_OPTIONS ?? '',
+    '--max-old-space-size=8192',
+  ].join(' ').trim(),
+};
+
 // Start nest in watch mode, inheriting stdio so output appears normally.
 // shell: true lets the OS resolve the correct nest binary/shim (nest.cmd on Windows).
 const child = spawn('nest', ['start', '--watch'], {
   stdio: 'inherit',
   shell: true,
+  env,
   // Run from the api workspace root (this script lives in apps/api/scripts/)
   cwd: require('path').resolve(__dirname, '..'),
 });

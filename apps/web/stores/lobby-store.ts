@@ -1,4 +1,10 @@
 import { create } from 'zustand';
+import {
+  generateRandomSeed,
+  commitHash,
+  deriveMapSeed,
+} from '@repo/stellar';
+import { usePrivateStore } from './private-store';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
 
@@ -8,6 +14,7 @@ export type LobbyPhase =
   | 'waiting'
   | 'starting'
   | 'revealing'
+  | 'relaying'
   | 'beginning'
   | 'active'
   | 'ended'
@@ -31,6 +38,22 @@ export interface PendingAuthRequest {
   requestedAt: string;
 }
 
+// ─── Internal helpers ────────────────────────────────────────────────────────
+
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+function hexToBytes(hex: string): Uint8Array {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) {
+    out[i / 2] = parseInt(hex.slice(i, i + 2), 16);
+  }
+  return out;
+}
+
 // ─── Store state & actions ───────────────────────────────────────────────────
 
 interface LobbyState {
@@ -40,19 +63,10 @@ interface LobbyState {
   error: string | null;
 
   /** Create a new game lobby, returns gameId. */
-  createLobby: (
-    playerAddress: string,
-    seedCommit: string,
-    seedSecret: string,
-  ) => Promise<string>;
+  createLobby: (playerAddress: string) => Promise<string>;
 
   /** Join an existing lobby by gameId. */
-  joinLobby: (
-    gameId: string,
-    playerAddress: string,
-    seedCommit: string,
-    seedSecret: string,
-  ) => Promise<void>;
+  joinLobby: (gameId: string, playerAddress: string) => Promise<void>;
 
   /**
    * Open an SSE connection to GET /api/lobby/:gameId/events.
@@ -88,7 +102,6 @@ interface LobbyState {
 
 // ─── Module-level EventSource (singleton per tab) ───────────────────────────
 
-// Kept outside the Zustand state to avoid serialisation issues.
 let _eventSource: EventSource | null = null;
 
 // ─── Zustand store ───────────────────────────────────────────────────────────
@@ -99,16 +112,36 @@ export const useLobbyStore = create<LobbyState>((set) => ({
   loading: false,
   error: null,
 
-  createLobby: async (playerAddress, seedCommit, seedSecret) => {
+  createLobby: async (playerAddress) => {
     set({ loading: true, error: null });
     try {
+      // Generate dice seed and map seed secrets locally.
+      const seedSecret     = generateRandomSeed();
+      const seedCommit     = commitHash(seedSecret);
+      const mapSeedSecret  = generateRandomSeed();
+      const mapSeedCommit  = commitHash(mapSeedSecret);
+
       const res = await fetch(`${API_URL}/api/lobby`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ playerAddress, seedCommit, seedSecret }),
+        body: JSON.stringify({
+          playerAddress,
+          seedCommit:    bytesToHex(seedCommit),
+          seedSecret:    bytesToHex(seedSecret),
+          mapSeedCommit: bytesToHex(mapSeedCommit),
+          mapSeedSecret: bytesToHex(mapSeedSecret),
+        }),
       });
       const data = await res.json() as { gameId?: string; error?: string };
       if (!res.ok) throw new Error(data.error ?? 'Failed to create lobby');
+
+      // Persist own secrets in the private store.
+      usePrivateStore.getState().initOwnSecrets(
+        data.gameId!,
+        bytesToHex(seedSecret),
+        bytesToHex(mapSeedSecret),
+      );
+
       return data.gameId!;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -119,16 +152,36 @@ export const useLobbyStore = create<LobbyState>((set) => ({
     }
   },
 
-  joinLobby: async (gameId, playerAddress, seedCommit, seedSecret) => {
+  joinLobby: async (gameId, playerAddress) => {
     set({ loading: true, error: null });
     try {
+      // Generate dice seed and map seed secrets locally.
+      const seedSecret     = generateRandomSeed();
+      const seedCommit     = commitHash(seedSecret);
+      const mapSeedSecret  = generateRandomSeed();
+      const mapSeedCommit  = commitHash(mapSeedSecret);
+
       const res = await fetch(`${API_URL}/api/lobby/${gameId}/join`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ playerAddress, seedCommit, seedSecret }),
+        body: JSON.stringify({
+          playerAddress,
+          seedCommit:    bytesToHex(seedCommit),
+          seedSecret:    bytesToHex(seedSecret),
+          mapSeedCommit: bytesToHex(mapSeedCommit),
+          mapSeedSecret: bytesToHex(mapSeedSecret),
+        }),
       });
       const data = await res.json() as LobbyInfo & { error?: string };
       if (!res.ok) throw new Error(data.error ?? 'Failed to join lobby');
+
+      // Persist own secrets in the private store.
+      usePrivateStore.getState().initOwnSecrets(
+        gameId,
+        bytesToHex(seedSecret),
+        bytesToHex(mapSeedSecret),
+      );
+
       set({ lobby: data });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -140,7 +193,6 @@ export const useLobbyStore = create<LobbyState>((set) => ({
   },
 
   connectSSE: (gameId) => {
-    // Close any existing connection before opening a new one
     if (_eventSource) {
       _eventSource.close();
       _eventSource = null;
@@ -159,7 +211,6 @@ export const useLobbyStore = create<LobbyState>((set) => ({
         const lobby = JSON.parse(event.data as string) as LobbyInfo;
         set({
           lobby,
-          // Extract pendingAuthRequest so use-game can react to it directly
           pendingAuth: lobby.pendingAuthRequest ?? null,
         });
       } catch (e) {
@@ -168,8 +219,6 @@ export const useLobbyStore = create<LobbyState>((set) => ({
     };
 
     es.onerror = () => {
-      // EventSource retries automatically — log but don't set an error state
-      // so the UI doesn't flash an error on transient reconnects.
       console.warn(`[SSE] Connection error for lobby ${gameId}, retrying...`);
     };
   },
@@ -189,7 +238,7 @@ export const useLobbyStore = create<LobbyState>((set) => ({
       const data = await res.json() as LobbyInfo;
       set({ lobby: data, pendingAuth: data.pendingAuthRequest ?? null });
     } catch {
-      // Silently swallow polling errors to avoid flooding the UI
+      // Silently swallow polling errors
     }
   },
 
@@ -208,3 +257,44 @@ export const useLobbyStore = create<LobbyState>((set) => ({
 
   clearError: () => set({ error: null }),
 }));
+
+// ─── Map secret relay helper (called from use-game.ts) ───────────────────────
+
+/**
+ * Exchange map secrets with the backend relay and persist the shared map seed.
+ * Called automatically when the lobby enters the 'relaying' phase.
+ *
+ * Returns the derived mapSeed as hex (needed to compute commitments for begin-match).
+ */
+export async function performMapSecretRelay(
+  gameId: string,
+  playerAddress: string,
+): Promise<string> {
+  const priv = usePrivateStore.getState();
+  if (priv.gameId !== gameId) {
+    throw new Error('Private game context mismatch. Please rejoin this game link.');
+  }
+  if (!priv.ownMapSecret) {
+    throw new Error('Map secret not initialised — create or join a lobby first');
+  }
+
+  const res = await fetch(`${API_URL}/api/lobby/${gameId}/map-secret`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ playerAddress, mapSecret: priv.ownMapSecret }),
+  });
+
+  const data = await res.json() as { opponentMapSecret?: string; error?: string };
+  if (!res.ok || !data.opponentMapSecret) {
+    throw new Error(data.error ?? 'Map secret relay failed');
+  }
+
+  const ownBytes      = hexToBytes(priv.ownMapSecret);
+  const opponentBytes = hexToBytes(data.opponentMapSecret);
+  const mapSeedBytes  = deriveMapSeed(ownBytes, opponentBytes);
+  const mapSeed       = bytesToHex(mapSeedBytes);
+
+  priv.setRelayedSecrets(data.opponentMapSecret, mapSeed);
+
+  return mapSeed;
+}

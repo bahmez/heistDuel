@@ -68,6 +68,12 @@ export interface LobbyDocument {
   player2MapSeedCommit: string | null;
   /** Hex-encoded 32-byte secret — relayed to player1, then cleared. */
   player2MapSeedSecret: string | null;
+  /**
+   * Computed after begin_match succeeds: keccak256(p1SeedSecret || p2SeedSecret).
+   * Stored so both players get the same value even if they call begin-match at
+   * different times (idempotent relay).
+   */
+  sessionSeed?: string | null;
   phase: LobbyPhase;
   error?: string;
   createdAt: string;
