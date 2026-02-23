@@ -18,6 +18,24 @@ const CAMERA_CONFIGS: Record<ViewMode, { position: [number, number, number]; tar
   topdown: { position: [0, 36, 0.01],  target: [0, 0, 0] },
 }
 
+// ─── Renderer & lighting config ───────────────────────────────────────────────
+
+const LIGHTING_CONFIG = {
+  exposure: 0,
+  ambientIntensity: 0.3,
+  directIntensity: 2.5,
+  ambientColor: '#ffffff',
+  directColor: '#ffffff',
+} as const
+
+function RendererConfig() {
+  const { gl } = useThree()
+  useEffect(() => {
+    gl.toneMappingExposure = LIGHTING_CONFIG.exposure
+  }, [gl])
+  return null
+}
+
 function CameraController({ mode }: { mode: ViewMode }) {
   const { camera, controls } = useThree()
 
@@ -643,7 +661,14 @@ export function GameBoard3D(props: GameBoard3DProps) {
           </>
         )}
 
-        <ambientLight intensity={1} />
+        <RendererConfig />
+        <ambientLight color={LIGHTING_CONFIG.ambientColor} intensity={LIGHTING_CONFIG.ambientIntensity} />
+        <directionalLight
+          color={LIGHTING_CONFIG.directColor}
+          intensity={LIGHTING_CONFIG.directIntensity}
+          position={[12, 18, 10]}
+          castShadow
+        />
 
         <Suspense fallback={null}>
           <GameScene3D {...props} />
