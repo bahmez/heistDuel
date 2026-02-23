@@ -31,6 +31,7 @@ const LIGHTING_CONFIG = {
 function RendererConfig() {
   const { gl } = useThree()
   useEffect(() => {
+    gl.toneMapping = THREE.LinearToneMapping
     gl.toneMappingExposure = LIGHTING_CONFIG.exposure
   }, [gl])
   return null
