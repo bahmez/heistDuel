@@ -1,6 +1,6 @@
 import sha3 from "js-sha3";
 const keccak = sha3.keccak256;
-import { poseidon2, poseidon3, poseidon4 } from "poseidon-lite";
+import { poseidon2, poseidon3, poseidon4, poseidon5 } from "poseidon-lite";
 import {
   MAP_W,
   MAP_H,
@@ -58,6 +58,8 @@ export interface MapData {
   loot: Uint8Array;     // 18-byte bitset
   cameras: Camera[];
   lasers: Laser[];
+  /** Exit cell (deterministic from map seed, away from spawns and walls). */
+  exitCell: { x: number; y: number };
 }
 
 /* ------------------------------------------------------------------ */
@@ -133,14 +135,6 @@ function writeU32BE(out: Uint8Array, offset: number, v: number): void {
 function writeI128BE(out: Uint8Array, offset: number, v: bigint): void {
   let bits = v < 0n ? v + (1n << 128n) : v;
   for (let i = 15; i >= 0; i--) {
-    out[offset + i] = Number(bits & 0xffn);
-    bits >>= 8n;
-  }
-}
-
-function writeU64BE(out: Uint8Array, offset: number, v: bigint): void {
-  let bits = v;
-  for (let i = 7; i >= 0; i--) {
     out[offset + i] = Number(bits & 0xffn);
     bits >>= 8n;
   }
@@ -282,39 +276,69 @@ export function generateMap(mapSeed: Uint8Array): MapData {
     const x = r % MAP_W;
     const y = Math.floor(r / MAP_W) % MAP_H;
     const bit = y * MAP_W + x;
-    if (!nearSpawn(x, y) && !bitIsSet(walls, bit) && !bitIsSet(loot, bit)) {
+    // bit < 127: keep loot_mask representable as a non-negative i128 on-chain.
+    if (!nearSpawn(x, y) && !bitIsSet(walls, bit) && !bitIsSet(loot, bit) && bit < 127) {
       bitSet(loot, bit);
       placedLoot++;
     }
   }
 
-  // Place cameras (up to 3)
+  // Place cameras (up to 3).
+  // radius: 1 → detects only center + 4 cardinal neighbours (cross of 5 cells).
   for (let c = 0; c < 3; c++) {
     const r = seededU32(mapSeed, 3, c);
     const x = r % MAP_W;
     const y = Math.floor(r / MAP_W) % MAP_H;
     if (!nearSpawn(x, y)) {
-      cameras.push({ x, y, radius: 2 });
+      cameras.push({ x, y, radius: 1 });
     }
   }
 
-  // Place lasers (up to 2)
+  // Place lasers (up to 2).
+  // Lasers are at most MAX_LASER_LEN cells long.  High 16 bits of the seed
+  // determine the start position so that each game gets a different segment.
+  const MAX_LASER_LEN = 5;
   for (let l = 0; l < 2; l++) {
     const r = seededU32(mapSeed, 4, l);
     if ((r & 1) === 0) {
+      // Horizontal laser — row chosen from low bits, start-x from high bits.
       const y = Math.floor(r / 17) % MAP_H;
       if (y > 1 && y < MAP_H - 2) {
-        lasers.push({ x1: 1, y1: y, x2: MAP_W - 2, y2: y });
+        const maxStart = MAP_W - 1 - MAX_LASER_LEN;          // inclusive upper bound for x1
+        const startX = 1 + ((r >>> 16) % maxStart);
+        const x1 = startX;
+        const x2 = Math.min(x1 + MAX_LASER_LEN - 1, MAP_W - 2);
+        lasers.push({ x1, y1: y, x2, y2: y });
       }
     } else {
+      // Vertical laser — column chosen from low bits, start-y from high bits.
       const x = Math.floor(r / 17) % MAP_W;
       if (x > 1 && x < MAP_W - 2) {
-        lasers.push({ x1: x, y1: 1, x2: x, y2: MAP_H - 2 });
+        const maxStart = MAP_H - 1 - MAX_LASER_LEN;
+        const startY = 1 + ((r >>> 16) % maxStart);
+        const y1 = startY;
+        const y2 = Math.min(y1 + MAX_LASER_LEN - 1, MAP_H - 2);
+        lasers.push({ x1: x, y1, x2: x, y2 });
       }
     }
   }
 
-  return { walls, loot, cameras, lasers };
+  // Place exit cell (tag 5) — deterministic, not on a wall, not near spawns.
+  let exitX = 0;
+  let exitY = 0;
+  for (let attempt = 0; attempt < 144; attempt++) {
+    const r = seededU32(mapSeed, 5, attempt);
+    const x = r % MAP_W;
+    const y = Math.floor(r / MAP_W) % MAP_H;
+    if (!nearSpawn(x, y) && !bitIsSet(walls, y * MAP_W + x)) {
+      exitX = x;
+      exitY = y;
+      break;
+    }
+  }
+  const exitCell = { x: exitX, y: exitY };
+
+  return { walls, loot, cameras, lasers, exitCell };
 }
 
 /**
@@ -410,7 +434,7 @@ export function deriveNewPosNonce(_posNonce: Uint8Array, _turnIndex: number): Ui
 /**
  * State commitment over all on-chain committed values.
  * Mirrors compute_state_commitment in engine.rs.
- * Must match exactly for the Noir circuit's state_commit_before/after checks.
+ * Per-player chess clocks replace the global deadline — no deadlineTs included.
  */
 export function computeStateCommitment(
   sessionId: number,
@@ -421,9 +445,8 @@ export function computeStateCommitment(
   player1PosCommit: Uint8Array,
   player2PosCommit: Uint8Array,
   sessionSeed: Uint8Array,
-  deadlineTs: bigint,
 ): Uint8Array {
-  const out = new Uint8Array(4 + 4 + 16 + 16 + 32 + 32 + 32 + 32 + 8);
+  const out = new Uint8Array(4 + 4 + 16 + 16 + 32 + 32 + 32 + 32);
   let off = 0;
   writeU32BE(out, off, sessionId); off += 4;
   writeU32BE(out, off, turnIndex); off += 4;
@@ -432,8 +455,7 @@ export function computeStateCommitment(
   out.set(mapCommitment, off); off += 32;
   out.set(player1PosCommit, off); off += 32;
   out.set(player2PosCommit, off); off += 32;
-  out.set(sessionSeed, off); off += 32;
-  writeU64BE(out, off, deadlineTs);
+  out.set(sessionSeed, off);
   return keccak256(out);
 }
 
@@ -467,7 +489,7 @@ export function rollValue(
  *
  * Formula (mirrors compute_turn_pi_hash() in engine.rs and the Circom circuit):
  *   h1      = Poseidon4(session_id, turn_index, player_tag, pos_commit_before_fr)
- *   h2      = Poseidon4(pos_commit_after_fr, score_delta_fr, loot_delta, no_path_flag)
+ *   h2      = Poseidon5(pos_commit_after_fr, score_delta_fr, loot_delta, no_path_flag, exited_flag)
  *   pi_hash = Poseidon2(h1, h2)
  *
  * score_delta: negative values → BN254 Fr representation (prime + value).
@@ -482,13 +504,14 @@ export function computeTurnPiHash(
   scoreDelta: bigint,
   lootDelta: number,
   noPathFlag: boolean,
+  exitedFlag: boolean,
 ): Uint8Array {
   const pcb = bytes32ToField(posCommitBefore);
   const pca = bytes32ToField(posCommitAfter);
   const sd  = intToField(scoreDelta);
 
   const h1 = poseidon4([BigInt(sessionId), BigInt(turnIndex), BigInt(playerTag), pcb]);
-  const h2 = poseidon4([pca, sd, BigInt(lootDelta), BigInt(noPathFlag ? 1 : 0)]);
+  const h2 = poseidon5([pca, sd, BigInt(lootDelta), BigInt(noPathFlag ? 1 : 0), BigInt(exitedFlag ? 1 : 0)]);
   const pi = poseidon2([h1, h2]);
   return fieldToBytes32(pi);
 }
@@ -628,7 +651,8 @@ export function computeLootDelta(
   const delta = zeroBitset();
   for (const pos of path) {
     const bit = pos.y * MAP_W + pos.x;
-    if (bitIsSet(loot, bit) && !bitIsSet(lootCollected, bit)) {
+    // bit < 127: loot_mask is stored as a non-negative i128 on-chain (bit 127 = sign bit).
+    if (bit < 127 && bitIsSet(loot, bit) && !bitIsSet(lootCollected, bit)) {
       bitSet(delta, bit);
     }
   }
@@ -643,13 +667,18 @@ export function countLootInDelta(delta: Uint8Array): number {
   return count;
 }
 
+/**
+ * Camera detection is cross-shaped (+): triggers when the player is in the
+ * same row OR same column as the camera, within its radius.
+ * Mirrors the updated game rules (cameras detect along axes, not radial area).
+ */
 export function computeCameraHits(path: Position[], cameras: Camera[]): number {
   let hits = 0;
   for (const cam of cameras) {
     for (const pos of path) {
       const dx = Math.abs(pos.x - cam.x);
       const dy = Math.abs(pos.y - cam.y);
-      if (dx + dy <= cam.radius) {
+      if ((dx === 0 && dy <= cam.radius) || (dy === 0 && dx <= cam.radius)) {
         hits++;
         break;
       }

@@ -89,7 +89,6 @@ function deserializeGameView(raw: unknown): GameView {
     player2:            r.player2 as string,
     status:             r.status  as import('@repo/stellar').GameStatus,
     startedAtTs:        r.startedAtTs  != null ? Number(r.startedAtTs)  : null,
-    deadlineTs:         r.deadlineTs   != null ? Number(r.deadlineTs)   : null,
     turnIndex:          Number(r.turnIndex),
     activePlayer:       r.activePlayer as string,
     player1Score:       BigInt(r.player1Score as string | number),
@@ -103,6 +102,12 @@ function deserializeGameView(raw: unknown): GameView {
     stateCommitment:    toUint8Array(r.stateCommitment),
     winner:             (r.winner as string | null) ?? null,
     lastProofId:        r.lastProofId != null ? toUint8Array(r.lastProofId) : null,
+    p1TimeRemaining:    r.p1TimeRemaining != null ? Number(r.p1TimeRemaining) : 600,
+    p2TimeRemaining:    r.p2TimeRemaining != null ? Number(r.p2TimeRemaining) : 600,
+    lastTurnStartTs:    r.lastTurnStartTs != null ? Number(r.lastTurnStartTs) : 0,
+    player1Exited:      Boolean(r.player1Exited),
+    player2Exited:      Boolean(r.player2Exited),
+    lootCollectedMask:  r.lootCollectedMask != null ? toUint8Array(r.lootCollectedMask) : new Uint8Array(18),
   };
 }
 
@@ -149,6 +154,18 @@ function buildPlayerGameView(
     visibleLasers  = mapData.lasers;
   }
 
+  const myExited      = isPlayer1 ? gameView.player1Exited : gameView.player2Exited;
+  const opponentExited = isPlayer1 ? gameView.player2Exited : gameView.player1Exited;
+  const myTimeRemaining = isPlayer1 ? gameView.p1TimeRemaining : gameView.p2TimeRemaining;
+
+  // Exit cell is derived from the map seed (same algorithm as engine.ts generateMap).
+  let exitCell: { x: number; y: number } | null = null;
+  if (priv.mapSeed) {
+    const mapSeedBytes = hexToBytes(priv.mapSeed);
+    const mapData = generateMap(mapSeedBytes);
+    exitCell = mapData.exitCell;
+  }
+
   return {
     ...gameView,
     player1Pos,
@@ -165,6 +182,10 @@ function buildPlayerGameView(
       priv.myFogMask
         ? hexToBytes(priv.myFogMask)
         : new Uint8Array(BITSET_BYTES),
+    myExited,
+    opponentExited,
+    exitCell,
+    myTimeRemaining,
   };
 }
 

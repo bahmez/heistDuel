@@ -27,6 +27,25 @@ const RPC_URL =
   process.env.NEXT_PUBLIC_SOROBAN_RPC_URL ||
   "https://soroban-testnet.stellar.org";
 
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001";
+
+/**
+ * Ask the backend to call pass_turn on-chain.
+ * Needed when the new active player has already exited the map so that the
+ * non-exited player can continue without having to wait for the exited player
+ * to submit turns. Non-fatal — logs and swallows errors.
+ */
+async function tryPassTurn(gameId: string): Promise<void> {
+  try {
+    await fetch(`${API_URL}/api/lobby/${gameId}/pass-turn`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+  } catch (err) {
+    console.warn("[pass_turn] Non-fatal error:", err);
+  }
+}
+
 async function createHeistClient(): Promise<HeistContractClient> {
   const cfg = await getRuntimeConfig();
   return new HeistContractClient(cfg.heistContractId, cfg.rpcUrl || RPC_URL);
@@ -134,17 +153,32 @@ export default function GamePage({
 
     setSubmitting(true);
     setTurnError(null);
-    setProvingStep("Computing ZK inputs...");
+    setProvingStep("Syncing game state...");
 
     try {
+      // Force a fresh game state fetch right before building the turn.
+      // The view in the store may be up to GAME_POLL_INTERVAL_MS stale; a stale
+      // turnIndex causes InvalidTurnData (#9) on the contract's simulation.
+      await game.refreshGameState();
+      const { view: freshView, roll: freshRoll } = useGameStore.getState();
+
+      if (!freshView || freshView.activePlayer !== address || freshView.status !== "Active") {
+        setTurnError("The game state was refreshed — it is not your turn yet. Please wait a moment and try again.");
+        return;
+      }
+      if (freshRoll === null) {
+        setTurnError("Roll value not available after refresh. Please try again.");
+        return;
+      }
+
       setProvingStep("Generating ZK proof (this may take a few minutes)...");
 
       const result = await buildTurn(
         address,
         game.sessionId,
         gameId,
-        game.view,
-        game.roll,
+        freshView,
+        freshRoll,
         selectedPath,
         game.vkHash,
       );
@@ -167,6 +201,16 @@ export default function GamePage({
       setSelectedPath([]);
       setProvingStep(null);
       await game.refreshGameState();
+
+      // If the new active player is the opponent and they have already exited,
+      // ask the backend to call pass_turn so that this player can keep playing.
+      const { view: afterView } = useGameStore.getState();
+      if (afterView && afterView.status === "Active" && afterView.activePlayer !== address && afterView.opponentExited) {
+        setProvingStep("Relaying turn skip for exited opponent...");
+        await tryPassTurn(gameId);
+        await game.refreshGameState();
+        setProvingStep(null);
+      }
     } catch (err: unknown) {
       setProvingStep(null);
       if (isTimerExpiredError(err)) {
@@ -183,22 +227,37 @@ export default function GamePage({
     if (!address || !game.view || !game.roll || !game.vkHash || !game.sessionId)
       return;
 
-    const startPos =
-      address === game.view.player1
-        ? game.view.player1Pos
-        : game.view.player2Pos;
-
     setSubmitting(true);
     setTurnError(null);
-    setProvingStep("Generating ZK proof for skip turn...");
+    setProvingStep("Syncing game state...");
 
     try {
+      // Same fresh-fetch guard as handleSubmitTurn to avoid stale-state errors.
+      await game.refreshGameState();
+      const { view: freshView, roll: freshRoll } = useGameStore.getState();
+
+      if (!freshView || freshView.activePlayer !== address || freshView.status !== "Active") {
+        setTurnError("The game state was refreshed — it is not your turn yet. Please wait a moment and try again.");
+        return;
+      }
+      if (freshRoll === null) {
+        setTurnError("Roll value not available after refresh. Please try again.");
+        return;
+      }
+
+      const startPos =
+        address === freshView.player1
+          ? freshView.player1Pos
+          : freshView.player2Pos;
+
+      setProvingStep("Generating ZK proof for skip turn...");
+
       const result = await buildTurn(
         address,
         game.sessionId,
         gameId,
-        game.view,
-        game.roll,
+        freshView,
+        freshRoll,
         [startPos],
         game.vkHash,
       );
@@ -213,13 +272,21 @@ export default function GamePage({
       await client.submitTx(signedTx);
 
       // Skip turn: position stays at startPos — advance nonce, no loot collected.
-      const sp = game.view!.player1 === address ? game.view!.player1Pos : game.view!.player2Pos;
-      advancePosNonce(newPosNonceHex, sp.x, sp.y);
+      advancePosNonce(newPosNonceHex, startPos.x, startPos.y);
 
       game.recordTurn(breakdown);
       setSelectedPath([]);
       setProvingStep(null);
       await game.refreshGameState();
+
+      // Same as handleSubmitTurn: pass the exited opponent's turn if needed.
+      const { view: afterSkipView } = useGameStore.getState();
+      if (afterSkipView && afterSkipView.status === "Active" && afterSkipView.activePlayer !== address && afterSkipView.opponentExited) {
+        setProvingStep("Relaying turn skip for exited opponent...");
+        await tryPassTurn(gameId);
+        await game.refreshGameState();
+        setProvingStep(null);
+      }
     } catch (err: unknown) {
       setProvingStep(null);
       if (isTimerExpiredError(err)) {

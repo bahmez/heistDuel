@@ -348,20 +348,30 @@ const ZK_WASM    = path.join(REPO_ROOT, 'target', 'wasm32v1-none', 'release', 'z
 const HEIST_WASM = path.join(REPO_ROOT, 'target', 'wasm32v1-none', 'release', 'heist.wasm');
 
 if (!SKIP_BUILD) {
-  const toolchainEnv = RUST_TOOLCHAIN ? { ...process.env, RUSTUP_TOOLCHAIN: RUST_TOOLCHAIN } : process.env;
+  // Force cargo output into the workspace target dir so the deploy script can
+  // locate the WASM regardless of stellar CLI's internal temp-dir behaviour.
+  const toolchainEnv = {
+    ...(RUST_TOOLCHAIN ? { ...process.env, RUSTUP_TOOLCHAIN: RUST_TOOLCHAIN } : process.env),
+    CARGO_TARGET_DIR: path.join(REPO_ROOT, 'target'),
+  };
 
-  // Remove existing WASM artifacts before building to force a full recompile.
-  // This prevents Cargo's cache from serving a stale binary when source has changed.
-  if (fs.existsSync(ZK_WASM))    fs.unlinkSync(ZK_WASM);
-  if (fs.existsSync(HEIST_WASM)) fs.unlinkSync(HEIST_WASM);
+  if (!UPGRADE_HEIST_ID) {
+    // Full deploy: build both contracts.
+    // Remove existing WASM artifacts before building to force a full recompile.
+    if (fs.existsSync(ZK_WASM))    fs.unlinkSync(ZK_WASM);
+    if (fs.existsSync(HEIST_WASM)) fs.unlinkSync(HEIST_WASM);
 
-  step('Build zk-verifier wasm');
-  const buildZk = spawnSync(
-    STELLAR_BIN,
-    ['contract', 'build', '--manifest-path', path.join(REPO_ROOT, 'apps/contracts/zk-verifier/Cargo.toml')],
-    { stdio: 'inherit', env: toolchainEnv, cwd: REPO_ROOT },
-  );
-  if (buildZk.status !== 0) throw new Error('Build zk-verifier failed.');
+    step('Build zk-verifier wasm');
+    const buildZk = spawnSync(
+      STELLAR_BIN,
+      ['contract', 'build', '--manifest-path', path.join(REPO_ROOT, 'apps/contracts/zk-verifier/Cargo.toml')],
+      { stdio: 'inherit', env: toolchainEnv, cwd: REPO_ROOT },
+    );
+    if (buildZk.status !== 0) throw new Error('Build zk-verifier failed.');
+  } else {
+    // Upgrade mode: only rebuild the heist contract.
+    if (fs.existsSync(HEIST_WASM)) fs.unlinkSync(HEIST_WASM);
+  }
 
   step('Build heist wasm');
   const buildHeist = spawnSync(
@@ -372,7 +382,7 @@ if (!SKIP_BUILD) {
   if (buildHeist.status !== 0) throw new Error('Build heist failed.');
 }
 
-if (!fs.existsSync(ZK_WASM))    throw new Error(`WASM not found: ${ZK_WASM}`);
+if (!UPGRADE_HEIST_ID && !fs.existsSync(ZK_WASM)) throw new Error(`WASM not found: ${ZK_WASM}`);
 if (!fs.existsSync(HEIST_WASM)) throw new Error(`WASM not found: ${HEIST_WASM}`);
 
 // ---------------------------------------------------------------------------

@@ -162,6 +162,31 @@ export class LobbyService {
   }
 
   /**
+   * Skip the active player's turn when they have already exited.
+   * Admin-only — the backend signs and submits the pass_turn transaction.
+   * Called by the frontend after submitting its own turn when it detects
+   * that the new active player (the opponent) has already exited.
+   */
+  async passTurn(gameId: string): Promise<void> {
+    const lobby = await this.dbLobby.findByIdOrThrow(gameId);
+    if (!lobby.sessionId) {
+      throw new BadRequestException('Game has not started yet');
+    }
+    const client = this.stellar.getClient();
+    const adminAddress = this.stellar.getSourceAddress();
+    try {
+      const txXdr = await client.buildPassTurnTx(adminAddress, lobby.sessionId);
+      await this.stellar.signAndSubmit(txXdr, 'pass_turn');
+      this.logger.log(`[pass_turn] Passed turn for session ${lobby.sessionId}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // Not an error if the active player hasn't exited yet or game already ended.
+      this.logger.warn(`[pass_turn] Skipped (expected if conditions not met): ${msg}`);
+      throw new BadRequestException(`pass_turn failed: ${msg}`);
+    }
+  }
+
+  /**
    * Fetch the game state from the contract using the backend admin key.
    * get_game() requires admin auth; the backend source keypair IS the admin.
    * During Soroban simulation, require_auth() passes when source == admin.

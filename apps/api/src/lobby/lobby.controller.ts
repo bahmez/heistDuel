@@ -200,4 +200,19 @@ export class LobbyController {
     );
     return { ok: true, sessionSeed };
   }
+
+  /**
+   * POST /api/lobby/:gameId/pass-turn
+   *
+   * Skips the active player's turn when they have already exited the map.
+   * Admin-only on-chain; the backend signs and submits the pass_turn transaction.
+   * Called by the frontend after submitting its own turn when it detects
+   * that the new active player (the opponent) has exited.
+   */
+  @Post(':gameId/pass-turn')
+  @HttpCode(HttpStatus.OK)
+  async passTurn(@Param('gameId') gameId: string) {
+    await this.lobbyService.passTurn(gameId);
+    return { ok: true };
+  }
 }

@@ -21,13 +21,21 @@ export interface CellState {
   laser: boolean;
   hasPlayer1: boolean;
   hasPlayer2: boolean;
+  isExit: boolean;
 }
 
 /**
  * Convert a PlayerGameView into a 2D grid of CellStates for rendering.
+ *
+ * Privacy rules:
+ *   - Exited opponent: hidden from the map (avatar disappears).
+ *     No status text is shown, only the absence on the grid implies they left.
+ *   - Exit cell: always visible when revealed; the target destination to win.
  */
-export function buildGrid(view: PlayerGameView): CellState[][] {
+export function buildGrid(view: PlayerGameView, playerAddress: string): CellState[][] {
   const grid: CellState[][] = [];
+
+  const isPlayer1 = playerAddress === view.player1;
 
   for (let y = 0; y < MAP_H; y++) {
     grid[y] = [];
@@ -35,21 +43,40 @@ export function buildGrid(view: PlayerGameView): CellState[][] {
       const idx = y * MAP_W + x;
       const revealed = bitIsSet(view.myFog, idx);
       const wall = revealed && bitIsSet(view.visibleWalls, idx);
-      const loot = revealed && bitIsSet(view.visibleLoot, idx);
-      const lootCollected = bitIsSet(view.lootCollected, idx);
+      // Use the global collected mask from the contract to hide loot taken by either player.
+      const globallyCollected = bitIsSet(view.lootCollectedMask, idx);
+      const ownCollected = bitIsSet(view.lootCollected, idx);
+      // loot: available only if not yet taken by anyone globally.
+      const loot = revealed && bitIsSet(view.visibleLoot, idx) && !globallyCollected;
+      // lootCollected: show own-player collected cells as gray diamond (user feedback).
+      const lootCollected = revealed && bitIsSet(view.visibleLoot, idx) && ownCollected;
+
+      const isExitCell =
+        view.exitCell !== null &&
+        view.exitCell.x === x &&
+        view.exitCell.y === y;
+
+      // Own avatar always shown; opponent's avatar hidden once they exit.
+      const p1AtCell = view.player1Pos.x === x && view.player1Pos.y === y;
+      const p2AtCell = view.player2Pos.x === x && view.player2Pos.y === y;
+      // p1 is me → always show p1; p2 is opponent → hide if exited
+      const hasPlayer1 = p1AtCell && (isPlayer1 ? true : !view.opponentExited);
+      // p2 is me → always show p2; p1 is opponent → hide if exited
+      const hasPlayer2 = p2AtCell && (!isPlayer1 ? true : !view.opponentExited);
 
       grid[y]![x] = {
         x,
         y,
         revealed,
         wall,
-        loot: loot && !lootCollected,
-        lootCollected: loot && lootCollected,
+        loot: loot && !isExitCell,
+        lootCollected: lootCollected && !isExitCell,
         camera: false,
         cameraRadius: 0,
         laser: false,
-        hasPlayer1: view.player1Pos.x === x && view.player1Pos.y === y,
-        hasPlayer2: view.player2Pos.x === x && view.player2Pos.y === y,
+        hasPlayer1,
+        hasPlayer2,
+        isExit: isExitCell && revealed,
       };
     }
   }

@@ -55,17 +55,6 @@ function i128ToBytes(v: bigint): Uint8Array {
   return out;
 }
 
-/** Encode an unsigned u64 as 8 bytes big-endian. */
-function u64ToBytes(v: bigint): Uint8Array {
-  const out = new Uint8Array(8);
-  let bits = v;
-  for (let i = 7; i >= 0; i--) {
-    out[i] = Number(bits & 0xffn);
-    bits >>= 8n;
-  }
-  return out;
-}
-
 /** Human-readable path string for logs, e.g. "(2,3)→(3,3)→(4,3)". */
 function formatPath(path: Position[]): string {
   return path.map((p) => `(${p.x},${p.y})`).join("→");
@@ -91,6 +80,7 @@ export interface TurnBreakdown {
   turnIndex: number;
   player: string;
   noPathFlag: boolean;
+  exitedFlag: boolean;
   path: Position[];
   lootItems: number;
   cameraHits: number;
@@ -196,7 +186,10 @@ export async function buildTurn(
     fullPath = path;
     endPos   = fullPath[fullPath.length - 1]!;
 
-    lootDelta  = computeLootDelta(view.visibleLoot, view.lootCollected, fullPath);
+    // Use the global loot mask (from the contract) to compute available loot.
+    // This prevents scoring loot already collected by either player, and ensures
+    // lootMaskDelta won't conflict with the on-chain loot_collected_mask.
+    lootDelta  = computeLootDelta(view.visibleLoot, view.lootCollectedMask, fullPath);
     cameraHits = computeCameraHits(fullPath, view.visibleCameras);
     laserHits  = computeLaserHits(fullPath, view.visibleLasers);
     scoreDelta = computeScoreDelta(countLootInDelta(lootDelta), cameraHits, laserHits);
@@ -245,6 +238,25 @@ export async function buildTurn(
 
   const actualStartPos = { x: priv.posX, y: priv.posY };
 
+  // ─── Map data (needed for exit cell and available loot) ─────────────────────
+  if (!priv.mapSeed) {
+    throw new Error(
+      "Map seed missing. The ZK relay did not complete. " +
+      "Please reload the page and wait for the relay to finish.",
+    );
+  }
+  const mapData = generateMap(hexToBytes(priv.mapSeed));
+
+  // ─── Exit cell detection ─────────────────────────────────────────────────────
+  const exitCell = mapData.exitCell;
+
+  // exitedFlag: player lands exactly on the exit cell this turn (and hasn't exited before).
+  const exitedFlag =
+    !noPathFlag &&
+    !view.myExited &&
+    endPos.x === exitCell.x &&
+    endPos.y === exitCell.y;
+
   // ─── ZK commitment computation ──────────────────────────────────────────────
   const posCommitBefore = computePosCommit(actualStartPos.x, actualStartPos.y, posNonceBytes);
 
@@ -253,14 +265,14 @@ export async function buildTurn(
   const newPosNonce    = deriveNewPosNonce(posNonceBytes, view.turnIndex);
   const posCommitAfter = computePosCommit(endPos.x, endPos.y, newPosNonce);
 
-  // State commitments are still verified on-chain by the heist contract (Keccak,
-  // not part of the ZK circuit), so we still compute and submit them.
-  const stateCommitBefore = await client.getStateCommitment(playerAddress, sessionId);
+  // Use view.stateCommitment directly — it comes from the same state snapshot as
+  // view.turnIndex, ensuring both are always consistent with each other.
+  // A separate getStateCommitment() RPC call could hit a different ledger state
+  // than the backend API that provided turnIndex, causing InvalidTurnData (#9).
+  const stateCommitBefore = view.stateCommitment;
 
-  const deadlineTs      = BigInt(view.deadlineTs ?? 0);
-  const deadlineTsBytes = u64ToBytes(deadlineTs);
-  const activeScore     = isPlayer1 ? view.player1Score : view.player2Score;
-  const newActiveScore  = activeScore + scoreDelta;
+  const activeScore    = isPlayer1 ? view.player1Score : view.player2Score;
+  const newActiveScore = activeScore + scoreDelta;
 
   const otherPosCommit = isPlayer1 ? view.player2PosCommit : view.player1PosCommit;
   const newP1PosCommit = isPlayer1 ? posCommitAfter : otherPosCommit;
@@ -277,13 +289,12 @@ export async function buildTurn(
     newP1PosCommit,
     newP2PosCommit,
     sessionSeedBytes,
-    deadlineTs,
   );
 
   // ─── pi_hash (Groth16 public input) ─────────────────────────────────────────
   // Poseidon2(
   //   Poseidon4(session_id, turn_index, player_tag, pos_commit_before),
-  //   Poseidon4(pos_commit_after, score_delta_fr, loot_delta, no_path_flag)
+  //   Poseidon5(pos_commit_after, score_delta_fr, loot_delta, no_path_flag, exited_flag)
   // )
   const piHashBytes = computeTurnPiHash(
     sessionId,
@@ -294,25 +305,21 @@ export async function buildTurn(
     scoreDelta,
     lootItems,
     noPathFlag,
+    exitedFlag,
   );
 
   // ─── Groth16 circuit inputs ─────────────────────────────────────────────────
-  if (!priv.mapSeed) {
-    throw new Error(
-      "Map seed missing. The ZK relay did not complete. " +
-      "Please reload the page and wait for the relay to finish.",
-    );
-  }
-  const mapData = generateMap(hexToBytes(priv.mapSeed));
 
   // Remove already-collected loot from the map before passing to the circuit.
   // The circuit counts "loot cells along path" in map_loot, and lootDelta is the
   // count of UNCOLLECTED loot (via computeLootDelta). Passing raw mapData.loot would
   // include already-taken items and cause the circuit constraint to fail after the
   // first collected loot.
+  // Use the global loot mask so the circuit receives the same availability view
+  // as what was used to compute lootDelta and lootMaskDelta above.
   const availableLoot = new Uint8Array(mapData.loot.length);
   for (let i = 0; i < availableLoot.length; i++) {
-    availableLoot[i] = (mapData.loot[i] ?? 0) & ~(view.lootCollected[i] ?? 0);
+    availableLoot[i] = (mapData.loot[i] ?? 0) & ~(view.lootCollectedMask[i] ?? 0);
   }
 
   const pathX = fullPath.map((p) => p.x);
@@ -331,12 +338,15 @@ export async function buildTurn(
     pathY,
     pathLen:    noPathFlag ? 0 : Math.min(moveCount, 6),
     newPosNonce: bytesToHex(newPosNonce),
+    exitX:      exitCell.x,
+    exitY:      exitCell.y,
     sessionId,
     turnIndex:  view.turnIndex,
     playerTag,
     scoreDelta: Number(scoreDelta),
     lootDelta:  lootItems,
     noPathFlag: noPathFlag ? 1 : 0,
+    exitedFlag: exitedFlag ? 1 : 0,
     // Optional hints for backend logging
     posCommitBefore: bytesToHex(posCommitBefore),
     posCommitAfter:  bytesToHex(posCommitAfter),
@@ -353,11 +363,15 @@ export async function buildTurn(
     player:           playerAddress,
     scoreDelta,
     lootDelta:        lootItems,
+    // Bitset of newly collected loot cells; count must equal lootDelta.
+    // Contract verifies count matches and no overlap with global loot_collected_mask.
+    lootMaskDelta:    lootDelta,
     posCommitBefore,
     posCommitAfter,
     stateCommitBefore,
     stateCommitAfter,
     noPathFlag,
+    exitedFlag,
   };
 
   const { txXdr, authInfos } = await client.buildSubmitTurnTx(
@@ -383,6 +397,7 @@ export async function buildTurn(
     turnIndex:  view.turnIndex,
     player:     playerAddress,
     noPathFlag,
+    exitedFlag,
     path:       fullPath,
     lootItems,
     cameraHits,

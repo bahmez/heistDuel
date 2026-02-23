@@ -38,6 +38,35 @@ function i128Val(v: bigint): xdr.ScVal {
   return nativeToScVal(v, { type: "i128" });
 }
 
+/**
+ * Convert an 18-byte loot mask (Uint8Array) to the contract's i128 representation.
+ * Bytes 0-15 map to cells 0-127 (little-endian); bytes 16-17 are always 0 per
+ * the game constraint (loot cells limited to indices 0-126).
+ * Bit 127 is the i128 sign bit — we mask it out to keep the value non-negative.
+ */
+function lootMaskToI128(bytes: Uint8Array): bigint {
+  let v = 0n;
+  for (let i = 0; i < 16; i++) {
+    v |= BigInt(bytes[i] ?? 0) << BigInt(i * 8);
+  }
+  // Clear bit 127 (i128 sign bit) — loot cells are restricted to indices 0-126.
+  v &= (1n << 127n) - 1n;
+  return v;
+}
+
+/**
+ * Convert a contract i128 loot mask back to an 18-byte Uint8Array.
+ * The i128 is always non-negative (cells limited to 0-126).
+ */
+function i128ToLootMask(v: bigint): Uint8Array {
+  const bytes = new Uint8Array(18);
+  const mask = v < 0n ? v + (1n << 128n) : v;
+  for (let i = 0; i < 16; i++) {
+    bytes[i] = Number((mask >> BigInt(i * 8)) & 0xffn);
+  }
+  return bytes;
+}
+
 function addressVal(addr: string): xdr.ScVal {
   return new Address(addr).toScVal();
 }
@@ -54,11 +83,23 @@ function boolVal(v: boolean): xdr.ScVal {
  * Encode a TurnZkPublic as a Soroban ScvMap.
  * Fields must be in alphabetical order (Soroban contracttype requirement).
  */
+/**
+ * Encode a TurnZkPublic as a Soroban ScvMap.
+ * Fields must be in alphabetical order (Soroban contracttype requirement).
+ */
 function turnZkPublicVal(turn: TurnZkPublic): xdr.ScVal {
   return xdr.ScVal.scvMap([
     new xdr.ScMapEntry({
+      key: xdr.ScVal.scvSymbol("exited_flag"),
+      val: boolVal(turn.exitedFlag),
+    }),
+    new xdr.ScMapEntry({
       key: xdr.ScVal.scvSymbol("loot_delta"),
       val: u32Val(turn.lootDelta),
+    }),
+    new xdr.ScMapEntry({
+      key: xdr.ScVal.scvSymbol("loot_mask"),
+      val: i128Val(lootMaskToI128(turn.lootMaskDelta)),
     }),
     new xdr.ScMapEntry({
       key: xdr.ScVal.scvSymbol("no_path_flag"),
@@ -104,7 +145,10 @@ function turnZkPublicVal(turn: TurnZkPublic): xdr.ScVal {
 /* ------------------------------------------------------------------ */
 
 function parseBytesN(val: xdr.ScVal): Uint8Array {
-  return new Uint8Array(val.bytes());
+  if (!val) return new Uint8Array(32);
+  const b = val.bytes();
+  if (!b) return new Uint8Array(32);
+  return new Uint8Array(b);
 }
 
 function parseOptionalAddress(val: xdr.ScVal): string | null {
@@ -131,12 +175,15 @@ function parseGameView(resultVal: xdr.ScVal): GameView {
     view[key] = entry.val();
   }
 
+  const startedAtTs = BigInt(scValToNative(view["started_at_ts"] as xdr.ScVal) ?? 0n);
+  const lastProofBytes = parseBytesN(view["last_proof_id"] as xdr.ScVal);
+  const isZeroHash = lastProofBytes.every((b) => b === 0);
+
   return {
     player1: scValToNative(view["player1"] as xdr.ScVal),
     player2: scValToNative(view["player2"] as xdr.ScVal),
     status: parseGameStatus(view["status"] as xdr.ScVal) as GameView["status"],
-    startedAtTs: scValToNative(view["started_at_ts"] as xdr.ScVal) ?? null,
-    deadlineTs: scValToNative(view["deadline_ts"] as xdr.ScVal) ?? null,
+    startedAtTs: startedAtTs === 0n ? null : Number(startedAtTs),
     turnIndex: Number(scValToNative(view["turn_index"] as xdr.ScVal)),
     activePlayer: scValToNative(view["active_player"] as xdr.ScVal),
     player1Score: BigInt(scValToNative(view["player1_score"] as xdr.ScVal)),
@@ -149,10 +196,15 @@ function parseGameView(resultVal: xdr.ScVal): GameView {
     p2MapSeedCommit: parseBytesN(view["p2_map_seed_commit"] as xdr.ScVal),
     stateCommitment: parseBytesN(view["state_commitment"] as xdr.ScVal),
     winner: parseOptionalAddress(view["winner"] as xdr.ScVal),
-    lastProofId: (() => {
-      const v = scValToNative(view["last_proof_id"] as xdr.ScVal);
-      return v ? new Uint8Array(v) : null;
-    })(),
+    lastProofId: isZeroHash ? null : lastProofBytes,
+    p1TimeRemaining: Number(scValToNative(view["p1_time_remaining"] as xdr.ScVal) ?? 600),
+    p2TimeRemaining: Number(scValToNative(view["p2_time_remaining"] as xdr.ScVal) ?? 600),
+    lastTurnStartTs: Number(scValToNative(view["last_turn_start_ts"] as xdr.ScVal) ?? 0),
+    player1Exited: Boolean(scValToNative(view["player1_exited"] as xdr.ScVal)),
+    player2Exited: Boolean(scValToNative(view["player2_exited"] as xdr.ScVal)),
+    lootCollectedMask: i128ToLootMask(
+      BigInt(scValToNative(view["loot_mask"] as xdr.ScVal) ?? 0n),
+    ),
   };
 }
 
@@ -305,21 +357,6 @@ export class HeistContractClient {
       addressVal(player),
     );
     return Number(scValToNative(retval));
-  }
-
-  /** Compute the pi_hash for a given TurnZkPublic (used to build proof_blob). */
-  async computePiHash(
-    sourceAddress: string,
-    sessionId: number,
-    turn: TurnZkPublic,
-  ): Promise<Uint8Array> {
-    const retval = await this.simulateCall(
-      sourceAddress,
-      "compute_pi_hash",
-      u32Val(sessionId),
-      turnZkPublicVal(turn),
-    );
-    return parseBytesN(retval);
   }
 
   async getVkHash(
@@ -508,6 +545,34 @@ export class HeistContractClient {
 
     const assembled = rpc.assembleTransaction(tx, sim).build();
     return this.processAuthEntries(assembled, sim.latestLedger);
+  }
+
+  /**
+   * Build and simulate a pass_turn transaction.
+   * Admin-only: skips the active player's turn when they have already exited.
+   * Returns the assembled XDR string ready for signing.
+   */
+  async buildPassTurnTx(
+    sourceAddress: string,
+    sessionId: number,
+  ): Promise<string> {
+    const account = await this.server.getAccount(sourceAddress);
+    const tx = new TransactionBuilder(account, {
+      fee: "500000",
+      networkPassphrase: NETWORK_PASSPHRASE,
+    })
+      .addOperation(
+        this.ensureContract().call("pass_turn", u32Val(sessionId)),
+      )
+      .setTimeout(300)
+      .build();
+
+    const sim = await this.server.simulateTransaction(tx);
+    if (rpc.Api.isSimulationError(sim)) {
+      throw new Error(`pass_turn simulation error: ${sim.error}`);
+    }
+    const assembled = rpc.assembleTransaction(tx, sim).build();
+    return assembled.toXDR();
   }
 
   async buildEndIfFinishedTx(

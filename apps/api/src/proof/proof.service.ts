@@ -29,6 +29,10 @@ export interface ProveInputs {
   // Private: new position nonce (client generates fresh random, first byte = 0)
   newPosNonce: string;      // hex 32 bytes — treated as BN254 Fr element
 
+  // Private: exit cell coordinates (derived deterministically from map seed)
+  exitX: number;
+  exitY: number;
+
   // Public turn data (all committed via pi_hash inside the circuit)
   sessionId: number;
   turnIndex: number;
@@ -36,6 +40,7 @@ export interface ProveInputs {
   scoreDelta: number;       // net score change (can be negative)
   lootDelta: number;        // loot items collected this turn
   noPathFlag: number;       // 0 or 1
+  exitedFlag: number;       // 0 or 1 — player reached the exit cell this turn
 
   // Derived (computed by engine.ts) — included for logging/validation
   posCommitBefore?: string;  // hex 32 bytes
@@ -111,12 +116,15 @@ export class ProofService {
       path_y:        pathY.map(String),
       path_len:      String(inp.pathLen),
       new_pos_nonce: this.nonceToField(inp.newPosNonce),
+      exit_x:        String(inp.exitX),
+      exit_y:        String(inp.exitY),
       session_id:    String(inp.sessionId),
       turn_index:    String(inp.turnIndex),
       player_tag:    String(inp.playerTag),
       score_delta:   this.intToField(inp.scoreDelta),
       loot_delta:    String(inp.lootDelta),
       no_path_flag:  String(inp.noPathFlag),
+      exited_flag:   String(inp.exitedFlag),
     };
   }
 

@@ -41,6 +41,10 @@ class ProveTurnDto implements ProveInputs {
   // Private: new pos nonce
   @IsString()  newPosNonce!: string;
 
+  // Private: exit cell coordinates (derived from map seed)
+  @IsInt() @Min(0) @Max(11)  exitX!: number;
+  @IsInt() @Min(0) @Max(11)  exitY!: number;
+
   // Public: turn data
   @IsInt()           sessionId!: number;
   @IsInt()           turnIndex!: number;
@@ -48,6 +52,7 @@ class ProveTurnDto implements ProveInputs {
   @IsNumber()        scoreDelta!: number;
   @IsInt() @Min(0)   lootDelta!: number;
   @IsInt() @Min(0) @Max(1)  noPathFlag!: number;
+  @IsInt() @Min(0) @Max(1)  exitedFlag!: number;
 
   // Optional: pre-computed values for logging
   @IsOptional() @IsString()  posCommitBefore?: string;

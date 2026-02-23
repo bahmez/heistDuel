@@ -23,6 +23,7 @@ function TurnRow({ t }: { t: TurnBreakdown }) {
   if (t.noPathFlag) {
     parts.push("skip");
   } else {
+    if (t.exitedFlag) parts.push("exited ✓");
     if (t.lootItems > 0) parts.push(`+${t.lootItems} loot`);
     if (t.cameraHits > 0) parts.push(`${t.cameraHits} cam`);
     if (t.laserHits > 0) parts.push(`${t.laserHits} laser`);
@@ -38,26 +39,43 @@ function TurnRow({ t }: { t: TurnBreakdown }) {
   );
 }
 
+/**
+ * Compute the effective seconds remaining for the current player's turn,
+ * accounting for the time already elapsed since the turn started.
+ *
+ * The on-chain clock is only decremented when submit_turn is called;
+ * we compute the live value client-side to give a real-time countdown.
+ */
+function computeEffectiveTimeLeft(
+  remainingSeconds: number,
+  lastTurnStartTs: number,
+  isMyTurn: boolean,
+): number {
+  if (!isMyTurn) return remainingSeconds;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const elapsed = Math.max(0, nowSec - lastTurnStartTs);
+  return Math.max(0, remainingSeconds - elapsed);
+}
+
 export function ScorePanel({ view, playerAddress, turnHistory = [] }: ScorePanelProps) {
   const isPlayer1 = playerAddress === view.player1;
-  const isMyTurn = view.activePlayer === playerAddress;
+  const isMyTurn  = view.activePlayer === playerAddress;
 
-  const [timeLeft, setTimeLeft] = useState<number | null>(null);
-  const [showHistory, setShowHistory] = useState(false);
+  // Per-player chess clock — only show own time (opponent's is hidden by design).
+  const [myTimeLeft, setMyTimeLeft] = useState<number>(
+    computeEffectiveTimeLeft(view.myTimeRemaining, view.lastTurnStartTs, isMyTurn),
+  );
 
   useEffect(() => {
-    if (!view.deadlineTs) return;
-
     const update = () => {
-      const now = Math.floor(Date.now() / 1000);
-      const left = Number(view.deadlineTs) - now;
-      setTimeLeft(Math.max(0, left));
+      setMyTimeLeft(
+        computeEffectiveTimeLeft(view.myTimeRemaining, view.lastTurnStartTs, isMyTurn),
+      );
     };
-
     update();
     const interval = setInterval(update, 1000);
     return () => clearInterval(interval);
-  }, [view.deadlineTs]);
+  }, [view.myTimeRemaining, view.lastTurnStartTs, isMyTurn]);
 
   const formatTime = (seconds: number) => {
     const m = Math.floor(seconds / 60);
@@ -65,9 +83,13 @@ export function ScorePanel({ view, playerAddress, turnHistory = [] }: ScorePanel
     return `${m}:${s.toString().padStart(2, "0")}`;
   };
 
+  const myScore       = isPlayer1 ? view.player1Score : view.player2Score;
+  const opponentScore = isPlayer1 ? view.player2Score : view.player1Score;
+
   // Last turn submitted by me (most recent first)
   const myHistory = [...turnHistory].reverse();
-  const lastTurn = myHistory[0] ?? null;
+  const lastTurn  = myHistory[0] ?? null;
+  const [showHistory, setShowHistory] = useState(false);
 
   return (
     <div className="rounded-xl bg-heist-card border border-heist-border p-4 space-y-4">
@@ -76,60 +98,79 @@ export function ScorePanel({ view, playerAddress, turnHistory = [] }: ScorePanel
         <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">
           Score
         </h3>
-        {timeLeft !== null && (
+        {/* Own chess clock — never show opponent's */}
+        <div className="flex items-center gap-2">
+          {view.myExited && (
+            <span className="text-xs px-2 py-0.5 rounded-full bg-heist-green/20 text-heist-green border border-heist-green/30 font-semibold">
+              Exited ✓
+            </span>
+          )}
           <span
             className={`font-mono text-sm ${
-              timeLeft < 30 ? "text-heist-red" : "text-gray-300"
+              isMyTurn && myTimeLeft < 30
+                ? "text-heist-red animate-pulse"
+                : isMyTurn
+                  ? "text-heist-green"
+                  : "text-gray-500"
             }`}
+            title="Your remaining time"
           >
-            {formatTime(timeLeft)}
+            {formatTime(myTimeLeft)}
           </span>
-        )}
+        </div>
       </div>
 
       {/* ── Score rows ─────────────────────────────────────────── */}
       <div className="space-y-2">
+        {/* My score */}
         <div
           className={`flex justify-between items-center p-2 rounded-lg ${
             isPlayer1
               ? "bg-player1/10 border border-player1/20"
-              : "bg-heist-darker"
+              : "bg-player2/10 border border-player2/20"
           } ${
-            view.activePlayer === view.player1
-              ? "animate-pulse-border border border-player1/40"
-              : ""
+            isMyTurn ? "ring-1 ring-heist-green/40" : ""
           }`}
         >
           <div className="flex items-center gap-2">
-            <span className="w-2.5 h-2.5 rounded-full bg-player1" />
-            <span className="text-sm text-gray-300">
-              {isPlayer1 ? "You" : "Opponent"}
-            </span>
+            <span
+              className={`w-2.5 h-2.5 rounded-full ${
+                isPlayer1 ? "bg-player1" : "bg-player2"
+              }`}
+            />
+            <span className="text-sm text-gray-300">You</span>
+            {isMyTurn && (
+              <span className="text-xs text-heist-green font-mono">◂ turn</span>
+            )}
           </div>
           <span className="font-mono font-bold text-white">
-            {view.player1Score.toString()}
+            {myScore.toString()}
           </span>
         </div>
 
+        {/* Opponent score */}
         <div
           className={`flex justify-between items-center p-2 rounded-lg ${
             !isPlayer1
-              ? "bg-player2/10 border border-player2/20"
-              : "bg-heist-darker"
+              ? "bg-player1/10 border border-player1/20"
+              : "bg-player2/10 border border-player2/20"
           } ${
-            view.activePlayer === view.player2
-              ? "animate-pulse-border border border-player2/40"
-              : ""
+            !isMyTurn && view.status === "Active" ? "ring-1 ring-gray-500/30" : ""
           }`}
         >
           <div className="flex items-center gap-2">
-            <span className="w-2.5 h-2.5 rounded-full bg-player2" />
-            <span className="text-sm text-gray-300">
-              {!isPlayer1 ? "You" : "Opponent"}
-            </span>
+            <span
+              className={`w-2.5 h-2.5 rounded-full ${
+                !isPlayer1 ? "bg-player1" : "bg-player2"
+              }`}
+            />
+            <span className="text-sm text-gray-300">Opponent</span>
+            {!isMyTurn && view.status === "Active" && (
+              <span className="text-xs text-gray-500 font-mono">◂ turn</span>
+            )}
           </div>
           <span className="font-mono font-bold text-white">
-            {view.player2Score.toString()}
+            {opponentScore.toString()}
           </span>
         </div>
       </div>
@@ -152,15 +193,22 @@ export function ScorePanel({ view, playerAddress, turnHistory = [] }: ScorePanel
       {lastTurn && (
         <div
           className={`rounded-lg p-2 text-xs border ${
-            lastTurn.scoreDelta > 0n
-              ? "bg-heist-green/5 border-heist-green/20"
-              : lastTurn.scoreDelta < 0n
-                ? "bg-heist-red/5 border-heist-red/20"
-                : "bg-heist-darker border-heist-border/30"
+            lastTurn.exitedFlag
+              ? "bg-heist-green/10 border-heist-green/30"
+              : lastTurn.scoreDelta > 0n
+                ? "bg-heist-green/5 border-heist-green/20"
+                : lastTurn.scoreDelta < 0n
+                  ? "bg-heist-red/5 border-heist-red/20"
+                  : "bg-heist-darker border-heist-border/30"
           }`}
         >
           <div className="flex justify-between items-center mb-1">
-            <span className="text-gray-400 font-semibold">Last turn #{lastTurn.turnIndex}</span>
+            <span className="text-gray-400 font-semibold">
+              Last turn #{lastTurn.turnIndex}
+              {lastTurn.exitedFlag && (
+                <span className="ml-1 text-heist-green">— Exited!</span>
+              )}
+            </span>
             <span
               className={`font-mono font-bold ${
                 lastTurn.scoreDelta > 0n
@@ -195,7 +243,7 @@ export function ScorePanel({ view, playerAddress, turnHistory = [] }: ScorePanel
                   <span className="text-heist-red font-mono">−{lastTurn.laserHits * 2} pts</span>
                 </div>
               )}
-              {lastTurn.lootItems === 0 && lastTurn.cameraHits === 0 && lastTurn.laserHits === 0 && (
+              {lastTurn.lootItems === 0 && lastTurn.cameraHits === 0 && lastTurn.laserHits === 0 && !lastTurn.exitedFlag && (
                 <p className="text-gray-500">No loot, no hazards</p>
               )}
             </div>

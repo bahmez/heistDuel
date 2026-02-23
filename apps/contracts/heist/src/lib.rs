@@ -8,8 +8,8 @@ use soroban_sdk::{
 };
 
 use engine::{
-    commit_hash, compute_pos_commit, compute_state_commitment, compute_turn_pi_hash,
-    derive_session_seed, roll_value, GAME_SECONDS, LOOT_COUNT,
+    commit_hash, compute_state_commitment, compute_turn_pi_hash,
+    derive_session_seed, roll_value, PLAYER_TIME_SECONDS,
 };
 
 const GAME_TTL_LEDGERS: u32 = 518_400;
@@ -38,7 +38,7 @@ pub trait ZkVerifier {
 }
 
 #[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[derive(Copy, Clone)]
 #[repr(u32)]
 pub enum Error {
     GameNotFound = 1,
@@ -56,99 +56,95 @@ pub enum Error {
     InvalidStatus = 17,
     ProofRequired = 18,
     InvalidPublicInput = 19,
+    PlayerAlreadyExited = 20,
 }
 
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum GameStatus {
     WaitingReveal,
     Active,
     Ended,
 }
 
-/// Minimal public data committed per turn.
-/// All game-logic details (path, position, dice, hazards) are private
-/// and proven inside the ZK circuit. Only the outputs are public.
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct TurnZkPublic {
     pub session_id: u32,
     pub turn_index: u32,
     pub player: Address,
-    /// Net score change this turn (can be negative from hazard penalties).
     pub score_delta: i128,
-    /// Number of new loot items collected (always >= 0).
     pub loot_delta: u32,
-    /// Position commitment before the move.
+    // Bitmask of loot cells collected this turn (cells 0-126, flat index y*12+x).
+    // Bit N set means cell N was collected. count_ones() must equal loot_delta.
+    // Must not overlap with game.loot_mask (prevents double-collecting).
+    // Stored as i128; cell indices limited to 0-126 so value is always >= 0.
+    pub loot_mask: i128,
     pub pos_commit_before: BytesN<32>,
-    /// Position commitment after the move (new position + new nonce).
     pub pos_commit_after: BytesN<32>,
-    /// State commitment before the move (must match on-chain state_commitment).
     pub state_commit_before: BytesN<32>,
-    /// State commitment after the move (becomes new on-chain state_commitment).
     pub state_commit_after: BytesN<32>,
-    /// True when the player has no valid moves (fully surrounded by walls).
     pub no_path_flag: bool,
+    pub exited_flag: bool,
 }
 
-/// On-chain game state after ZK refactor.
-/// Raw map data (walls, loot, cameras, lasers, positions, fog) is no longer stored.
-/// Only cryptographic commitments are kept on-chain.
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct Game {
     pub player1: Address,
     pub player2: Address,
     pub player1_points: i128,
     pub player2_points: i128,
     pub status: GameStatus,
-    // Dice seed commit-reveal (session_seed becomes public after begin_match)
     pub p1_seed_commit: BytesN<32>,
     pub p2_seed_commit: BytesN<32>,
-    pub p1_seed_reveal: Option<BytesN<32>>,
-    pub p2_seed_reveal: Option<BytesN<32>>,
-    pub session_seed: Option<BytesN<32>>,
-    // Map seed commitments — secrets are relayed off-chain via backend.
-    // The map_seed = keccak(secret1 XOR secret2) is never posted on-chain.
+    // Zero hash = not yet revealed.
+    pub p1_seed_reveal: BytesN<32>,
+    pub p2_seed_reveal: BytesN<32>,
+    // Zero hash = seeds not yet combined.
+    pub session_seed: BytesN<32>,
     pub p1_map_seed_commit: BytesN<32>,
     pub p2_map_seed_commit: BytesN<32>,
-    // Map commitment set at begin_match: keccak(generate_map(map_seed)).
-    // Proves the correct map was used in ZK proofs without revealing the map.
     pub map_commitment: BytesN<32>,
-    // Position commitments: keccak(x ‖ y ‖ player_nonce).
-    // Player nonces are private; commitments are updated each turn.
     pub player1_pos_commit: BytesN<32>,
     pub player2_pos_commit: BytesN<32>,
-    // Scores are public (accumulated from proven score_delta values).
     pub player1_score: i128,
     pub player2_score: i128,
-    // Loot count only (not which cells — proven in circuit).
     pub loot_total_collected: u32,
-    // State commitment: keccak of all committed state fields.
-    // Chains turns together; must match state_commit_before in each proof.
+    // Global loot collected bitmask (cells 0-126, always >= 0).
+    pub loot_mask: i128,
     pub state_commitment: BytesN<32>,
-    pub started_at_ts: Option<u64>,
-    pub deadline_ts: Option<u64>,
+    // 0 = not yet started.
+    pub started_at_ts: u64,
     pub turn_index: u32,
     pub active_player: Address,
     pub winner: Option<Address>,
-    pub last_proof_id: Option<BytesN<32>>,
+    // Zero hash = no proof yet.
+    pub last_proof_id: BytesN<32>,
+    pub p1_time_remaining: u64,
+    pub p2_time_remaining: u64,
+    pub last_turn_start_ts: u64,
+    pub player1_exited: bool,
+    pub player2_exited: bool,
+    // u64::MAX = not yet exited; otherwise the turn_index when this player exited.
+    pub p1_exit_turn: u64,
+    pub p2_exit_turn: u64,
 }
 
-/// Public view of game state — exposes only commitment values, never raw map/positions.
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct GameView {
     pub player1: Address,
     pub player2: Address,
     pub status: GameStatus,
-    pub started_at_ts: Option<u64>,
-    pub deadline_ts: Option<u64>,
+    // 0 = not yet started.
+    pub started_at_ts: u64,
     pub turn_index: u32,
     pub active_player: Address,
     pub player1_score: i128,
     pub player2_score: i128,
     pub loot_total_collected: u32,
+    pub loot_mask: i128,
     pub map_commitment: BytesN<32>,
     pub player1_pos_commit: BytesN<32>,
     pub player2_pos_commit: BytesN<32>,
@@ -156,7 +152,25 @@ pub struct GameView {
     pub p2_map_seed_commit: BytesN<32>,
     pub state_commitment: BytesN<32>,
     pub winner: Option<Address>,
-    pub last_proof_id: Option<BytesN<32>>,
+    // Zero hash = no proof yet.
+    pub last_proof_id: BytesN<32>,
+    pub p1_time_remaining: u64,
+    pub p2_time_remaining: u64,
+    pub last_turn_start_ts: u64,
+    pub player1_exited: bool,
+    pub player2_exited: bool,
+}
+
+// ── Loot mask helpers (i128 bitmask, cells 0-126) ─────────────────────────────
+
+#[inline(always)]
+fn count_loot_bits(mask: i128) -> u32 {
+    mask.count_ones()
+}
+
+#[inline(always)]
+fn loot_bits_overlap(a: i128, b: i128) -> bool {
+    (a & b) != 0
 }
 
 #[contracttype]
@@ -173,7 +187,6 @@ pub struct HeistContract;
 
 #[contractimpl]
 impl HeistContract {
-    /// Initializes admin, game hub and verifier addresses.
     pub fn __constructor(env: Env, admin: Address, game_hub: Address, verifier: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
@@ -184,11 +197,6 @@ impl HeistContract {
             .set(&DataKey::VerifierAddress, &verifier);
     }
 
-    /// Creates a new 2-player session.
-    ///
-    /// Each player commits to two secrets:
-    /// - `pN_seed_commit`: for dice PRNG (revealed publicly later via reveal_seed)
-    /// - `pN_map_seed_commit`: for map generation (secret stays off-chain; backend relays it)
     pub fn start_game(
         env: Env,
         session_id: u32,
@@ -223,20 +231,19 @@ impl HeistContract {
             p2_map_seed_commit.clone().into_val(&env),
         ]);
 
-        let hub_addr: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::GameHubAddress)
-            .expect("hub missing");
-        let hub = GameHubClient::new(&env, &hub_addr);
-        hub.start_game(
-            &env.current_contract_address(),
-            &session_id,
-            &player1,
-            &player2,
-            &player1_points,
-            &player2_points,
-        );
+        // Notify hub of the new session. Non-fatal — game proceeds even if hub is
+        // unavailable (e.g. during isolated testnet deployments).
+        if let Some(hub_addr) = env.storage().instance().get::<_, Address>(&DataKey::GameHubAddress) {
+            let hub = GameHubClient::new(&env, &hub_addr);
+            let _ = hub.try_start_game(
+                &env.current_contract_address(),
+                &session_id,
+                &player1,
+                &player2,
+                &player1_points,
+                &player2_points,
+            );
+        }
 
         let zero32 = BytesN::from_array(&env, &[0u8; 32]);
         let game = Game {
@@ -247,9 +254,9 @@ impl HeistContract {
             status: GameStatus::WaitingReveal,
             p1_seed_commit,
             p2_seed_commit,
-            p1_seed_reveal: None,
-            p2_seed_reveal: None,
-            session_seed: None,
+            p1_seed_reveal: zero32.clone(),
+            p2_seed_reveal: zero32.clone(),
+            session_seed: zero32.clone(),
             p1_map_seed_commit,
             p2_map_seed_commit,
             map_commitment: zero32.clone(),
@@ -258,20 +265,26 @@ impl HeistContract {
             player1_score: 0,
             player2_score: 0,
             loot_total_collected: 0,
-            state_commitment: zero32,
-            started_at_ts: None,
-            deadline_ts: None,
+            loot_mask: 0i128,
+            state_commitment: zero32.clone(),
+            started_at_ts: 0,
             turn_index: 0,
             active_player: player1.clone(),
             winner: None,
-            last_proof_id: None,
+            last_proof_id: zero32,
+            p1_time_remaining: PLAYER_TIME_SECONDS,
+            p2_time_remaining: PLAYER_TIME_SECONDS,
+            last_turn_start_ts: 0,
+            player1_exited: false,
+            player2_exited: false,
+            p1_exit_turn: u64::MAX,
+            p2_exit_turn: u64::MAX,
         };
 
         Self::save_game(&env, session_id, &game);
         Ok(())
     }
 
-    /// Reveals a previously committed dice seed from a player.
     pub fn reveal_seed(
         env: Env,
         session_id: u32,
@@ -285,24 +298,25 @@ impl HeistContract {
             return Err(Error::InvalidStatus);
         }
 
+        let zero32 = BytesN::from_array(&env, &[0u8; 32]);
         let reveal_hash = commit_hash(&env, &seed_secret);
 
         if player == game.player1 {
-            if game.p1_seed_reveal.is_some() {
+            if game.p1_seed_reveal != zero32 {
                 return Err(Error::SeedAlreadyRevealed);
             }
             if reveal_hash != game.p1_seed_commit {
                 return Err(Error::InvalidSeedReveal);
             }
-            game.p1_seed_reveal = Some(seed_secret);
+            game.p1_seed_reveal = seed_secret;
         } else if player == game.player2 {
-            if game.p2_seed_reveal.is_some() {
+            if game.p2_seed_reveal != zero32 {
                 return Err(Error::SeedAlreadyRevealed);
             }
             if reveal_hash != game.p2_seed_commit {
                 return Err(Error::InvalidSeedReveal);
             }
-            game.p2_seed_reveal = Some(seed_secret);
+            game.p2_seed_reveal = seed_secret;
         } else {
             return Err(Error::NotPlayer);
         }
@@ -311,19 +325,6 @@ impl HeistContract {
         Ok(())
     }
 
-    /// Starts the match after both dice seeds are revealed.
-    ///
-    /// Map is NOT generated on-chain. Players compute the map off-chain from
-    /// their private map_seeds (exchanged via backend relay) and submit the
-    /// agreed map_commitment and their initial position commitments.
-    ///
-    /// The backend relay flow (off-chain):
-    ///   1. Both players send their map_secret to the backend.
-    ///   2. Backend verifies keccak(map_secret_i) == pN_map_seed_commit (on-chain).
-    ///   3. Backend cross-relays: P1 gets secret2, P2 gets secret1.
-    ///   4. Each player computes: map_seed = keccak(secret1 XOR secret2).
-    ///   5. Each player computes: map_data = generate_map(map_seed), map_commitment = keccak(map_data).
-    ///   6. Both players sign begin_match() with the same map_commitment.
     pub fn begin_match(
         env: Env,
         session_id: u32,
@@ -338,15 +339,17 @@ impl HeistContract {
         game.player1.require_auth();
         game.player2.require_auth();
 
-        let p1 = game.p1_seed_reveal.clone().ok_or(Error::SeedsNotReady)?;
-        let p2 = game.p2_seed_reveal.clone().ok_or(Error::SeedsNotReady)?;
+        let zero32 = BytesN::from_array(&env, &[0u8; 32]);
+        if game.p1_seed_reveal == zero32 || game.p2_seed_reveal == zero32 {
+            return Err(Error::SeedsNotReady);
+        }
+        let p1 = game.p1_seed_reveal.clone();
+        let p2 = game.p2_seed_reveal.clone();
 
         let session_seed = derive_session_seed(&env, session_id, &p1, &p2);
-
         let now = env.ledger().timestamp();
-        let deadline = now + GAME_SECONDS;
 
-        // Compute initial state commitment with the provided commitments.
+        // Compute initial state commitment without deadline (chess clocks replace global timer).
         let state_commitment = compute_state_commitment(
             &env,
             session_id,
@@ -357,37 +360,27 @@ impl HeistContract {
             &p1_pos_commit,
             &p2_pos_commit,
             &session_seed,
-            deadline,
         );
 
-        game.session_seed = Some(session_seed);
+        game.session_seed = session_seed;
         game.map_commitment = map_commitment;
         game.player1_pos_commit = p1_pos_commit;
         game.player2_pos_commit = p2_pos_commit;
         game.loot_total_collected = 0;
         game.state_commitment = state_commitment;
-        game.started_at_ts = Some(now);
-        game.deadline_ts = Some(deadline);
+        game.started_at_ts = now;
         game.status = GameStatus::Active;
         game.active_player = game.player1.clone();
         game.turn_index = 0;
+        // Initialize per-player chess clocks.
+        game.p1_time_remaining = PLAYER_TIME_SECONDS;
+        game.p2_time_remaining = PLAYER_TIME_SECONDS;
+        game.last_turn_start_ts = now;
 
         Self::save_game(&env, session_id, &game);
         Ok(())
     }
 
-    /// Verifies a Groth16 ZK turn proof and applies the proven state transition.
-    ///
-    /// The Circom circuit proves (privately, over BN254 with Poseidon):
-    ///   - pos_commit_before = Poseidon3(pos_x, pos_y, pos_nonce)
-    ///   - pos_commit_after  = Poseidon3(end_x, end_y, new_nonce)
-    ///   - Path is valid (adjacency, bounds, no walls)
-    ///   - loot_delta is correctly computed from the path
-    ///   - score_delta = loot_delta − camera_hits − laser_hits * 2
-    ///
-    /// The single public input is pi_hash (Poseidon-based), embedded at
-    /// proof_blob[4..36]. The contract verifies this binding before calling
-    /// the Groth16 verifier.
     pub fn submit_turn(
         env: Env,
         session_id: u32,
@@ -401,10 +394,6 @@ impl HeistContract {
         if game.status != GameStatus::Active {
             return Err(Error::GameAlreadyEnded);
         }
-        if game.deadline_ts.unwrap_or(0) <= env.ledger().timestamp() {
-            Self::end_if_finished(env.clone(), session_id)?;
-            return Err(Error::TimerExpired);
-        }
         if player != game.active_player {
             return Err(Error::NotActivePlayer);
         }
@@ -415,13 +404,47 @@ impl HeistContract {
             return Err(Error::InvalidTurnData);
         }
 
+        let is_player1 = player == game.player1;
+
+        // Block an already-exited player from submitting any further turns.
+        // The backend should call pass_turn() to advance past them instead.
+        if is_player1 && game.player1_exited {
+            return Err(Error::PlayerAlreadyExited);
+        }
+        if !is_player1 && game.player2_exited {
+            return Err(Error::PlayerAlreadyExited);
+        }
+
+        // Deduct elapsed time from the active player's chess clock.
+        let now = env.ledger().timestamp();
+        let elapsed = now.saturating_sub(game.last_turn_start_ts);
+        if is_player1 {
+            if elapsed >= game.p1_time_remaining {
+                game.p1_time_remaining = 0;
+                game.active_player = game.player2.clone();
+                Self::save_game(&env, session_id, &game);
+                Self::end_if_finished(env.clone(), session_id)?;
+                return Err(Error::TimerExpired);
+            }
+            game.p1_time_remaining -= elapsed;
+        } else {
+            if elapsed >= game.p2_time_remaining {
+                game.p2_time_remaining = 0;
+                game.active_player = game.player1.clone();
+                Self::save_game(&env, session_id, &game);
+                Self::end_if_finished(env.clone(), session_id)?;
+                return Err(Error::TimerExpired);
+            }
+            game.p2_time_remaining -= elapsed;
+        }
+
         // Groth16 proof blob: [4 n_pub=1][32 pi_hash][64 pi_a][128 pi_b][64 pi_c] = 292 bytes
         if proof_blob.len() < 292 {
             return Err(Error::ProofRequired);
         }
 
         // Verify pos_commit_before matches stored commitment for the active player.
-        let expected_pos_commit_before = if player == game.player1 {
+        let expected_pos_commit_before = if is_player1 {
             game.player1_pos_commit.clone()
         } else {
             game.player2_pos_commit.clone()
@@ -435,14 +458,9 @@ impl HeistContract {
             return Err(Error::StateCommitMismatch);
         }
 
-        let player_tag: u32 = if player == game.player1 { 1 } else { 2 };
+        let player_tag: u32 = if is_player1 { 1 } else { 2 };
 
         // Compute the expected pi_hash from public turn data.
-        // The Circom circuit must compute this identically as its single public input.
-        // Formula: Poseidon2(
-        //   Poseidon4(session_id, turn_index, player_tag, pos_commit_before),
-        //   Poseidon4(pos_commit_after, score_delta_fr, loot_delta, no_path_flag)
-        // )
         let expected_pi = compute_turn_pi_hash(
             &env,
             session_id,
@@ -453,6 +471,7 @@ impl HeistContract {
             public_turn.score_delta,
             public_turn.loot_delta,
             public_turn.no_path_flag,
+            public_turn.exited_flag,
         );
 
         // Verify proof_blob[0..4] = 0x00000001 (count = 1 public input).
@@ -481,7 +500,7 @@ impl HeistContract {
             return Err(Error::InvalidPublicInput);
         }
 
-        // Call the ZK verifier — proof_blob contains public inputs + proof bytes.
+        // Call the ZK verifier.
         let verifier_addr: Address = env
             .storage()
             .instance()
@@ -491,28 +510,64 @@ impl HeistContract {
         let proof_id = verifier.verify_proof_with_stored_vk(&proof_blob);
 
         // Apply proven state changes.
-        if player == game.player1 {
+        if is_player1 {
             game.player1_score = game
                 .player1_score
                 .checked_add(public_turn.score_delta)
                 .ok_or(Error::InvalidScoreDelta)?;
             game.player1_pos_commit = public_turn.pos_commit_after.clone();
-            game.active_player = game.player2.clone();
+            if public_turn.exited_flag {
+                game.player1_exited = true;
+                game.p1_exit_turn = game.turn_index as u64;
+            }
         } else {
             game.player2_score = game
                 .player2_score
                 .checked_add(public_turn.score_delta)
                 .ok_or(Error::InvalidScoreDelta)?;
             game.player2_pos_commit = public_turn.pos_commit_after.clone();
-            game.active_player = game.player1.clone();
+            if public_turn.exited_flag {
+                game.player2_exited = true;
+                game.p2_exit_turn = game.turn_index as u64;
+            }
         }
 
+        // Validate loot mask: popcount must match the circuit-proven count,
+        // and no bit may overlap with already globally-collected loot cells.
+        if count_loot_bits(public_turn.loot_mask) != public_turn.loot_delta {
+            return Err(Error::InvalidTurnData);
+        }
+        if loot_bits_overlap(public_turn.loot_mask, game.loot_mask) {
+            return Err(Error::InvalidTurnData);
+        }
+        // Accumulate global loot mask and total count.
+        game.loot_mask |= public_turn.loot_mask;
         game.loot_total_collected = game
             .loot_total_collected
             .saturating_add(public_turn.loot_delta);
         game.turn_index += 1;
         game.state_commitment = public_turn.state_commit_after.clone();
-        game.last_proof_id = Some(proof_id.clone());
+        game.last_proof_id = proof_id.clone();
+        game.last_turn_start_ts = now;
+
+        // Advance to next active player. If they have already exited,
+        // skip them immediately so the backend never needs to call pass_turn().
+        game.active_player = if is_player1 {
+            game.player2.clone()
+        } else {
+            game.player1.clone()
+        };
+        {
+            let next_is_p1 = game.active_player == game.player1;
+            let next_exited = if next_is_p1 { game.player1_exited } else { game.player2_exited };
+            if next_exited {
+                game.active_player = if next_is_p1 {
+                    game.player2.clone()
+                } else {
+                    game.player1.clone()
+                };
+            }
+        }
 
         Self::save_game(&env, session_id, &game);
         env.events()
@@ -522,7 +577,46 @@ impl HeistContract {
         Ok(())
     }
 
-    /// Ends the game when timeout or full loot collection is reached.
+    pub fn pass_turn(env: Env, session_id: u32) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("admin missing");
+        admin.require_auth();
+
+        let mut game = Self::require_game(&env, session_id)?;
+        if game.status != GameStatus::Active {
+            return Err(Error::GameAlreadyEnded);
+        }
+
+        let active_is_p1 = game.active_player == game.player1;
+        let active_has_exited = if active_is_p1 {
+            game.player1_exited
+        } else {
+            game.player2_exited
+        };
+
+        if !active_has_exited {
+            // Nothing to pass — active player has not exited.
+            return Err(Error::NotActivePlayer);
+        }
+
+        // Advance to the non-exited player.
+        game.active_player = if active_is_p1 {
+            game.player2.clone()
+        } else {
+            game.player1.clone()
+        };
+
+        // Reset the clock baseline so the new active player's clock starts now.
+        game.last_turn_start_ts = env.ledger().timestamp();
+
+        Self::save_game(&env, session_id, &game);
+        Self::end_if_finished(env.clone(), session_id)?;
+        Ok(())
+    }
+
     pub fn end_if_finished(env: Env, session_id: u32) -> Result<(), Error> {
         let mut game = Self::require_game(&env, session_id)?;
 
@@ -530,15 +624,48 @@ impl HeistContract {
             return Ok(());
         }
 
-        let deadline = game.deadline_ts.unwrap_or(u64::MAX);
-        let timeout = env.ledger().timestamp() >= deadline;
-        let all_loot_collected = game.loot_total_collected >= LOOT_COUNT;
+        // Account for time elapsed since the current turn started.
+        if game.status == GameStatus::Active {
+            let now = env.ledger().timestamp();
+            let elapsed = now.saturating_sub(game.last_turn_start_ts);
+            if game.active_player == game.player1 {
+                if elapsed >= game.p1_time_remaining {
+                    game.p1_time_remaining = 0;
+                }
+            } else if elapsed >= game.p2_time_remaining {
+                game.p2_time_remaining = 0;
+            }
+        }
 
-        if !timeout && !all_loot_collected {
+        let p1_clock_out = game.p1_time_remaining == 0;
+        let p2_clock_out = game.p2_time_remaining == 0;
+        let both_exited = game.player1_exited && game.player2_exited;
+        let game_over = both_exited || p1_clock_out || p2_clock_out;
+
+        if !game_over {
             return Ok(());
         }
 
-        let player1_won = game.player1_score >= game.player2_score;
+        // Determine winner.
+        let player1_won = if both_exited {
+            // Both exited: higher score wins; tie → earlier exit_turn wins.
+            if game.player1_score != game.player2_score {
+                game.player1_score > game.player2_score
+            } else {
+                // Earlier exit wins (lower turn number; u64::MAX = not exited).
+                game.p1_exit_turn <= game.p2_exit_turn
+            }
+        } else if game.player1_exited && p2_clock_out {
+            // Only player1 exited and player2 timed out → player1 wins.
+            true
+        } else if game.player2_exited && p1_clock_out {
+            // Only player2 exited and player1 timed out → player2 wins.
+            false
+        } else {
+            // Neither exited (or only one exited without the other timing out) → score tiebreak.
+            game.player1_score >= game.player2_score
+        };
+
         let winner = if player1_won {
             game.player1.clone()
         } else {
@@ -549,13 +676,12 @@ impl HeistContract {
         game.winner = Some(winner);
         Self::save_game(&env, session_id, &game);
 
-        let hub_addr: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::GameHubAddress)
-            .expect("hub missing");
-        let hub = GameHubClient::new(&env, &hub_addr);
-        hub.end_game(&session_id, &player1_won);
+        // Notify hub of the result. Non-fatal — the game is already recorded as Ended
+        // on-chain; a hub failure must not prevent the turn transaction from succeeding.
+        if let Some(hub_addr) = env.storage().instance().get::<_, Address>(&DataKey::GameHubAddress) {
+            let hub = GameHubClient::new(&env, &hub_addr);
+            let _ = hub.try_end_game(&session_id, &player1_won);
+        }
 
         env.events().publish(
             (symbol_short!("ended"), session_id),
@@ -565,7 +691,6 @@ impl HeistContract {
         Ok(())
     }
 
-    /// Returns the full committed game state. Admin-only.
     pub fn get_game(env: Env, session_id: u32) -> Result<GameView, Error> {
         let admin: Address = env
             .storage()
@@ -579,12 +704,12 @@ impl HeistContract {
             player2: game.player2,
             status: game.status,
             started_at_ts: game.started_at_ts,
-            deadline_ts: game.deadline_ts,
             turn_index: game.turn_index,
             active_player: game.active_player,
             player1_score: game.player1_score,
             player2_score: game.player2_score,
             loot_total_collected: game.loot_total_collected,
+            loot_mask: game.loot_mask,
             map_commitment: game.map_commitment,
             player1_pos_commit: game.player1_pos_commit,
             player2_pos_commit: game.player2_pos_commit,
@@ -593,17 +718,19 @@ impl HeistContract {
             state_commitment: game.state_commitment,
             winner: game.winner,
             last_proof_id: game.last_proof_id,
+            p1_time_remaining: game.p1_time_remaining,
+            p2_time_remaining: game.p2_time_remaining,
+            last_turn_start_ts: game.last_turn_start_ts,
+            player1_exited: game.player1_exited,
+            player2_exited: game.player2_exited,
         })
     }
 
-    /// Returns the current state commitment (used by clients to build turn proofs).
     pub fn get_state_commitment(env: Env, session_id: u32) -> Result<BytesN<32>, Error> {
         let game = Self::require_game(&env, session_id)?;
         Ok(game.state_commitment.clone())
     }
 
-    /// Returns the deterministic dice value for the current turn.
-    /// Clients and the ZK prover use this to know what rolled value to prove.
     pub fn get_expected_roll(env: Env, session_id: u32, player: Address) -> Result<u32, Error> {
         let game = Self::require_game(&env, session_id)?;
         if game.status != GameStatus::Active {
@@ -616,39 +743,7 @@ impl HeistContract {
         } else {
             return Err(Error::NotPlayer);
         };
-        let session_seed = game.session_seed.ok_or(Error::SeedsNotReady)?;
-        Ok(roll_value(&env, session_seed, game.turn_index, player_tag))
-    }
-
-    /// Returns the pi_hash that the Circom circuit must produce as its public input.
-    /// Useful for client-side proof construction validation.
-    pub fn compute_pi_hash(env: Env, session_id: u32, public_turn: TurnZkPublic) -> Result<BytesN<32>, Error> {
-        let game = Self::require_game(&env, session_id)?;
-        let player_tag: u32 = if public_turn.player == game.player1 { 1 } else { 2 };
-        Ok(compute_turn_pi_hash(
-            &env,
-            session_id,
-            public_turn.turn_index,
-            player_tag,
-            &public_turn.pos_commit_before,
-            &public_turn.pos_commit_after,
-            public_turn.score_delta,
-            public_turn.loot_delta,
-            public_turn.no_path_flag,
-        ))
-    }
-
-    /// Returns the Poseidon-based position commitment for the given (x, y, nonce).
-    /// Mirrors the Circom circuit's pos_commit computation.
-    pub fn compute_pos_commit_view(env: Env, x: u32, y: u32, nonce: BytesN<32>) -> BytesN<32> {
-        compute_pos_commit(&env, x, y, &nonce)
-    }
-
-    pub fn get_admin(env: Env) -> Address {
-        env.storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("admin missing")
+        Ok(roll_value(&env, game.session_seed, game.turn_index, player_tag))
     }
 
     pub fn set_admin(env: Env, new_admin: Address) {
@@ -661,13 +756,6 @@ impl HeistContract {
         env.storage().instance().set(&DataKey::Admin, &new_admin);
     }
 
-    pub fn get_hub(env: Env) -> Address {
-        env.storage()
-            .instance()
-            .get(&DataKey::GameHubAddress)
-            .expect("hub missing")
-    }
-
     pub fn set_hub(env: Env, new_hub: Address) {
         let admin: Address = env
             .storage()
@@ -678,13 +766,6 @@ impl HeistContract {
         env.storage()
             .instance()
             .set(&DataKey::GameHubAddress, &new_hub);
-    }
-
-    pub fn get_verifier(env: Env) -> Address {
-        env.storage()
-            .instance()
-            .get(&DataKey::VerifierAddress)
-            .expect("verifier missing")
     }
 
     pub fn set_verifier(env: Env, new_verifier: Address) {

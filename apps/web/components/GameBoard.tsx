@@ -23,7 +23,7 @@ export function GameBoard({
   onCellClick,
   isMyTurn,
 }: GameBoardProps) {
-  const grid = useMemo(() => buildGrid(view), [view]);
+  const grid = useMemo(() => buildGrid(view, playerAddress), [view, playerAddress]);
 
   const reachableCells = useMemo(() => {
     if (!isMyTurn || !roll) return new Set<string>();
@@ -78,10 +78,18 @@ export function GameBoard({
           <span className="text-loot">&#9670;</span> Loot
         </span>
         <span className="flex items-center gap-1">
-          <span className="text-camera">&#9673;</span> Camera
+          {/* Camera detects in a cross (+): same row or column within radius */}
+          <span className="relative inline-block w-3 h-3">
+            <span className="absolute left-1/2 top-0 -translate-x-1/2 w-[3px] h-full bg-camera/80 rounded-full" />
+            <span className="absolute top-1/2 left-0 -translate-y-1/2 h-[3px] w-full bg-camera/80 rounded-full" />
+          </span>
+          Camera (✛)
         </span>
         <span className="flex items-center gap-1">
           <span className="w-3 h-[2px] bg-laser inline-block" /> Laser
+        </span>
+        <span className="flex items-center gap-1">
+          <span className="text-heist-green text-base leading-none">⬡</span> Exit
         </span>
         <span className="flex items-center gap-1">
           <span className="w-3 h-3 rounded-sm bg-fog inline-block border border-gray-700" /> Fog

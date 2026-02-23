@@ -5,7 +5,7 @@ use soroban_sdk::{
 };
 
 use crate::{
-    engine::{commit_hash, derive_session_seed, roll_value},
+    engine::{commit_hash, compute_turn_pi_hash, derive_session_seed, roll_value},
     GameStatus, HeistContract, HeistContractClient, TurnZkPublic,
 };
 
@@ -90,9 +90,9 @@ fn make_test_proof_blob(env: &Env, pi_hash: &BytesN<32>) -> Bytes {
         blob.push_back(pi_hash.get(k).unwrap_or(0));
         k += 1;
     }
-    // Minimal dummy proof bytes (mock verifier accepts anything)
+    // Dummy proof bytes: need total >= 292 (4 + 32 + padding).
     let mut p = 0u32;
-    while p < 32 {
+    while p < 256 {
         blob.push_back(0xAB);
         p += 1;
     }
@@ -238,8 +238,9 @@ fn tie_break_player1_on_timeout() {
     let p2_pos = BytesN::from_array(&env, &[0x66u8; 32]);
     heist.begin_match(&session_id, &map_commitment, &p1_pos, &p2_pos);
 
+    // Advance past PLAYER_TIME_SECONDS (600s) so p1's clock expires.
     env.ledger().with_mut(|li| {
-        li.timestamp += 301;
+        li.timestamp += 601;
     });
 
     heist.end_if_finished(&session_id);
@@ -324,13 +325,14 @@ fn submit_turn_updates_state() {
     heist.reveal_seed(&session_id, &player2, &s2);
 
     let map_commitment = BytesN::from_array(&env, &[0xAAu8; 32]);
-    let p1_pos_commit = BytesN::from_array(&env, &[0xBBu8; 32]);
-    let p2_pos_commit = BytesN::from_array(&env, &[0xCCu8; 32]);
+    // Use zero-prefixed values so they are valid BN254 Fr elements (< field prime starting 0x30).
+    let p1_pos_commit = BytesN::from_array(&env, &{let mut a=[0u8;32]; a[31]=0x01; a});
+    let p2_pos_commit = BytesN::from_array(&env, &{let mut a=[0u8;32]; a[31]=0x02; a});
     heist.begin_match(&session_id, &map_commitment, &p1_pos_commit, &p2_pos_commit);
 
     // Get the initial state commitment
     let state_commit_before = heist.get_state_commitment(&session_id);
-    let new_pos_commit = BytesN::from_array(&env, &[0xDDu8; 32]);
+    let new_pos_commit = BytesN::from_array(&env, &{let mut a=[0u8;32]; a[31]=0x03; a});
     let state_commit_after = BytesN::from_array(&env, &[0xEEu8; 32]);
 
     // Build the public turn data
@@ -340,15 +342,30 @@ fn submit_turn_updates_state() {
         player: player1.clone(),
         score_delta: 1,
         loot_delta: 1,
+        loot_mask: 1i128, // bit 0 set = loot cell 0
         pos_commit_before: p1_pos_commit.clone(),
         pos_commit_after: new_pos_commit.clone(),
         state_commit_before: state_commit_before.clone(),
         state_commit_after: state_commit_after.clone(),
         no_path_flag: false,
+        exited_flag: false,
     };
 
-    // Compute the pi_hash that the contract will verify
-    let pi_hash = heist.compute_pi_hash(&session_id, &public_turn);
+    // Compute the pi_hash directly using the engine function (player1 = tag 1)
+    let pi_hash = env.as_contract(&heist_id, || {
+        compute_turn_pi_hash(
+            &env,
+            session_id,
+            public_turn.turn_index,
+            1u32,
+            &public_turn.pos_commit_before,
+            &public_turn.pos_commit_after,
+            public_turn.score_delta,
+            public_turn.loot_delta,
+            public_turn.no_path_flag,
+            public_turn.exited_flag,
+        )
+    });
     let proof_blob = make_test_proof_blob(&env, &pi_hash);
 
     heist.submit_turn(&session_id, &player1, &proof_blob, &public_turn);

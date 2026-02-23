@@ -3,6 +3,7 @@ import {
   Keypair,
   rpc,
   xdr,
+  Transaction,
   TransactionBuilder,
 } from '@stellar/stellar-sdk';
 import { HeistContractClient, NETWORK_PASSPHRASE } from '@repo/stellar';
@@ -18,6 +19,8 @@ const TRY_AGAIN_MAX_RETRIES = 8;
 const TRY_AGAIN_DELAY_MS = 5_000;
 const POLL_INTERVAL_MS = 3_000;
 const MAX_POLL_WAIT_MS = 120_000;
+const BAD_SEQ_MAX_RETRIES = 5;
+const BAD_SEQ_DELAY_MS = 3_000;
 
 /**
  * NestJS service wrapping Stellar/Soroban interactions.
@@ -134,6 +137,9 @@ export class StellarService implements OnModuleInit {
    *
    * Strategy:
    * - Retry on TRY_AGAIN_LATER (tx not forwarded yet — safe to resend).
+   * - Retry on txBAD_SEQ by rebuilding the transaction with a fresh sequence
+   *   number. Player Soroban auth entries remain valid because their preimage
+   *   does not include the outer envelope sequence number.
    * - Poll getTransaction for up to 120 s.
    * - Fall back to account-sequence heuristic if still NOT_FOUND after polling.
    */
@@ -146,28 +152,49 @@ export class StellarService implements OnModuleInit {
     const kp = this.sourceKeypair;
     const server = new rpc.Server(this.rpcUrl);
 
-    const accountBefore = await server.getAccount(kp.publicKey());
-    const seqBefore = BigInt(accountBefore.sequenceNumber());
-    const expectedSeqAfter = seqBefore + 1n;
-
-    const tx = TransactionBuilder.fromXDR(txXdr, NETWORK_PASSPHRASE);
+    let tx = TransactionBuilder.fromXDR(txXdr, NETWORK_PASSPHRASE);
     tx.signatures.splice(0);
     tx.sign(kp);
 
-    // Submit with TRY_AGAIN_LATER retries
     let sendResult: rpc.Api.SendTransactionResponse | null = null;
-    for (let attempt = 0; attempt <= TRY_AGAIN_MAX_RETRIES; attempt++) {
-      if (attempt > 0) {
+
+    for (let badSeqAttempt = 0; badSeqAttempt <= BAD_SEQ_MAX_RETRIES; badSeqAttempt++) {
+      // Submit with TRY_AGAIN_LATER retries
+      for (let attempt = 0; attempt <= TRY_AGAIN_MAX_RETRIES; attempt++) {
+        if (attempt > 0) {
+          this.logger.log(
+            `[${label}] TRY_AGAIN_LATER — waiting ${TRY_AGAIN_DELAY_MS / 1000}s before retry (${attempt}/${TRY_AGAIN_MAX_RETRIES})`,
+          );
+          await this.sleep(TRY_AGAIN_DELAY_MS);
+        }
+        sendResult = await server.sendTransaction(tx);
         this.logger.log(
-          `[${label}] TRY_AGAIN_LATER — waiting ${TRY_AGAIN_DELAY_MS / 1000}s before retry (${attempt}/${TRY_AGAIN_MAX_RETRIES})`,
+          `[${label}] send status=${sendResult.status} hash=${sendResult.hash}`,
         );
-        await this.sleep(TRY_AGAIN_DELAY_MS);
+        if (sendResult.status !== 'TRY_AGAIN_LATER') break;
       }
-      sendResult = await server.sendTransaction(tx);
-      this.logger.log(
-        `[${label}] send status=${sendResult.status} hash=${sendResult.hash}`,
-      );
-      if (sendResult.status !== 'TRY_AGAIN_LATER') break;
+
+      if (!sendResult) throw new Error('sendTransaction never attempted');
+      if (sendResult.status === 'TRY_AGAIN_LATER') {
+        throw new Error(
+          `Send failed: still TRY_AGAIN_LATER after ${TRY_AGAIN_MAX_RETRIES} retries`,
+        );
+      }
+
+      // On txBAD_SEQ: rebuild with a fresh sequence number and retry.
+      // Player Soroban auth entries embedded in operations are sequence-agnostic.
+      if (sendResult.status === 'ERROR' && this.isBadSeqError(sendResult)) {
+        if (badSeqAttempt >= BAD_SEQ_MAX_RETRIES) break;
+        this.logger.warn(
+          `[${label}] txBAD_SEQ detected — fetching fresh sequence and rebuilding (attempt ${badSeqAttempt + 1}/${BAD_SEQ_MAX_RETRIES})`,
+        );
+        await this.sleep(BAD_SEQ_DELAY_MS);
+        tx = await this.rebuildWithFreshSequence(server, tx, kp, label);
+        sendResult = null;
+        continue;
+      }
+
+      break;
     }
 
     if (!sendResult) throw new Error('sendTransaction never attempted');
@@ -177,11 +204,10 @@ export class StellarService implements OnModuleInit {
         `Send failed: ${sendResult.errorResult?.toXDR('base64') ?? 'unknown'}`,
       );
     }
-    if (sendResult.status === 'TRY_AGAIN_LATER') {
-      throw new Error(
-        `Send failed: still TRY_AGAIN_LATER after ${TRY_AGAIN_MAX_RETRIES} retries`,
-      );
-    }
+
+    // Capture expected post-tx sequence for the heuristic fallback
+    const txSequence = BigInt((tx as Transaction).sequence);
+    const expectedSeqAfter = txSequence; // after submission, account seq === tx.sequence
 
     // Poll getTransaction
     const start = Date.now();
@@ -207,14 +233,14 @@ export class StellarService implements OnModuleInit {
       if (seqAfter === expectedSeqAfter) {
         this.logger.warn(
           `[${label}] getTransaction returned NOT_FOUND but account sequence ` +
-            `advanced exactly as expected (${seqBefore} → ${seqAfter}). Treating as success.`,
+            `advanced to ${seqAfter} as expected. Treating as success.`,
         );
         return { hash: sendResult.hash, confirmedViaSequence: true };
       }
 
       throw new Error(
         `[${label}] Transaction NOT_FOUND after ${MAX_POLL_WAIT_MS / 1000}s ` +
-          `and sequence ${seqBefore} → ${seqAfter} (expected ${expectedSeqAfter}). ` +
+          `and sequence is ${seqAfter} (expected ${expectedSeqAfter}). ` +
           `hash: ${sendResult.hash}`,
       );
     }
@@ -223,6 +249,77 @@ export class StellarService implements OnModuleInit {
     const details = this.extractFailureDetails(getResult, label);
     this.logger.error(details);
     throw new Error(details);
+  }
+
+  /** Returns true when the send error is txBAD_SEQ (-5). */
+  private isBadSeqError(sendResult: rpc.Api.SendTransactionResponse): boolean {
+    try {
+      const resultCode = sendResult.errorResult?.result().switch().value;
+      return resultCode === -5; // TransactionResultCode.txBAD_SEQ
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Rebuild a Soroban transaction with a fresh sequence number while preserving:
+   *  - All XDR operations (including embedded player Soroban auth entries)
+   *  - The SorobanTransactionData extension (footprint + resource limits)
+   *  - The original fee and time bounds
+   *
+   * Player auth preimages don't include the outer envelope sequence, so their
+   * signatures remain valid after rebuild.
+   */
+  private async rebuildWithFreshSequence(
+    server: rpc.Server,
+    original: ReturnType<typeof TransactionBuilder.fromXDR>,
+    kp: Keypair,
+    label: string,
+  ): Promise<ReturnType<typeof TransactionBuilder.fromXDR>> {
+    const freshAccount = await server.getAccount(kp.publicKey());
+    this.logger.log(
+      `[${label}] Rebuilding with fresh sequence: ${freshAccount.sequenceNumber()}`,
+    );
+
+    const tx = original as Transaction;
+    const envelope = tx.toEnvelope().v1();
+    const innerTx = envelope.tx();
+
+    const builder = new TransactionBuilder(freshAccount, {
+      fee: tx.fee,
+      networkPassphrase: NETWORK_PASSPHRASE,
+    });
+
+    // Copy Soroban resource data (footprint + resource limits) from the original
+    // assembled transaction. Without this, the tx is rejected as txMALFORMED.
+    try {
+      const ext = innerTx.ext();
+      if ((ext.switch() as unknown as number) === 1) {
+        builder.setSorobanData(ext.sorobanData());
+      }
+    } catch {
+      this.logger.warn(`[${label}] Could not extract Soroban ext data — tx may lack resource footprint`);
+    }
+
+    // Copy raw XDR operations to avoid Operation vs Operation2 type mismatch
+    // and to preserve embedded Soroban auth entries exactly as-is.
+    for (const xdrOp of innerTx.operations()) {
+      builder.addOperation(xdrOp);
+    }
+
+    if (tx.timeBounds) {
+      builder.setTimebounds(
+        Number(tx.timeBounds.minTime),
+        Number(tx.timeBounds.maxTime),
+      );
+    } else {
+      builder.setTimeout(300);
+    }
+
+    const rebuilt = builder.build() as ReturnType<typeof TransactionBuilder.fromXDR>;
+    rebuilt.signatures.splice(0);
+    rebuilt.sign(kp);
+    return rebuilt;
   }
 
   private extractFailureDetails(

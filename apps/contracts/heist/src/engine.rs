@@ -1,7 +1,7 @@
 use soroban_sdk::{crypto::BnScalar, vec, Bytes, BytesN, Env, U256};
 use soroban_poseidon::poseidon_hash;
 
-pub const GAME_SECONDS: u64 = 3600;
+pub const PLAYER_TIME_SECONDS: u64 = 300; // 5 minutes per player (chess clock)
 pub const LOOT_COUNT: u32 = 24;
 
 // ── BN254 Fr prime (big-endian) ───────────────────────────────────────────────
@@ -91,6 +91,7 @@ pub fn compute_pos_commit(env: &Env, x: u32, y: u32, nonce: &BytesN<32>) -> Byte
 ///
 /// Kept as keccak256 (not in ZK circuit). The circuit no longer re-derives
 /// state commitments; the heist contract verifies them independently.
+/// deadline_ts has been removed — per-player chess clocks replace the global deadline.
 pub fn compute_state_commitment(
     env: &Env,
     session_id: u32,
@@ -101,7 +102,6 @@ pub fn compute_state_commitment(
     player1_pos_commit: &BytesN<32>,
     player2_pos_commit: &BytesN<32>,
     session_seed: &BytesN<32>,
-    deadline_ts: u64,
 ) -> BytesN<32> {
     let mut b = Bytes::new(env);
     b.append(&Bytes::from_array(env, &session_id.to_be_bytes()));
@@ -112,7 +112,6 @@ pub fn compute_state_commitment(
     b.append(&Bytes::from(player1_pos_commit.clone()));
     b.append(&Bytes::from(player2_pos_commit.clone()));
     b.append(&Bytes::from(session_seed.clone()));
-    b.append(&Bytes::from_array(env, &deadline_ts.to_be_bytes()));
     env.crypto().keccak256(&b).into()
 }
 
@@ -120,7 +119,7 @@ pub fn compute_state_commitment(
 ///
 /// Formula (matches the Circom circuit exactly):
 ///   h1       = Poseidon4(session_id, turn_index, player_tag, pos_commit_before)
-///   h2       = Poseidon4(pos_commit_after, score_delta_fr, loot_delta, no_path_flag)
+///   h2       = Poseidon5(pos_commit_after, score_delta_fr, loot_delta, no_path_flag, exited_flag)
 ///   pi_hash  = Poseidon2(h1, h2)
 ///
 /// score_delta uses BN254 Fr representation: negative values → prime + value.
@@ -134,6 +133,7 @@ pub fn compute_turn_pi_hash(
     score_delta: i128,
     loot_delta: u32,
     no_path_flag: bool,
+    exited_flag: bool,
 ) -> BytesN<32> {
     // h1 = Poseidon4(session_id, turn_index, player_tag, pos_commit_before)
     let h1 = poseidon_hash::<5, BnScalar>(env, &vec![
@@ -144,13 +144,14 @@ pub fn compute_turn_pi_hash(
         bytes32_to_u256(env, pos_commit_before),
     ]);
 
-    // h2 = Poseidon4(pos_commit_after, score_delta_fr, loot_delta, no_path_flag)
-    let h2 = poseidon_hash::<5, BnScalar>(env, &vec![
+    // h2 = Poseidon5(pos_commit_after, score_delta_fr, loot_delta, no_path_flag, exited_flag)
+    let h2 = poseidon_hash::<6, BnScalar>(env, &vec![
         env,
         bytes32_to_u256(env, pos_commit_after),
         i128_to_u256(env, score_delta),
         u32_to_u256(env, loot_delta),
         u32_to_u256(env, if no_path_flag { 1 } else { 0 }),
+        u32_to_u256(env, if exited_flag { 1 } else { 0 }),
     ]);
 
     // pi_hash = Poseidon2(h1, h2)

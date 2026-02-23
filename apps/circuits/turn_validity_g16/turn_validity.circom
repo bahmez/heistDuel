@@ -4,9 +4,12 @@ pragma circom 2.1.6;
 //
 // PUBLIC output: pi_hash = Poseidon2(
 //   Poseidon4(session_id, turn_index, player_tag, pos_commit_before),
-//   Poseidon4(pos_commit_after, score_delta, loot_delta, no_path_flag)
+//   Poseidon5(pos_commit_after, score_delta, loot_delta, no_path_flag, exited_flag)
 // )
 // where pos_commit = Poseidon3(x, y, nonce)  — matches soroban-poseidon on-chain.
+//
+// exited_flag = 1 means the player reached the exit cell this turn.
+// exit_x, exit_y are private inputs (derived deterministically from the map seed).
 
 include "node_modules/circomlib/circuits/poseidon.circom";
 include "node_modules/circomlib/circuits/bitify.circom";
@@ -96,6 +99,9 @@ template TurnValidity() {
 
     signal input new_pos_nonce;
 
+    signal input exit_x;          // exit cell x-coordinate (from map generation)
+    signal input exit_y;          // exit cell y-coordinate (from map generation)
+
     // ── Public turn data ───────────────────────────────────────────────────────
     signal input session_id;
     signal input turn_index;
@@ -103,6 +109,7 @@ template TurnValidity() {
     signal input score_delta;     // BN254 Fr (negative → prime + value)
     signal input loot_delta;
     signal input no_path_flag;    // 0 or 1
+    signal input exited_flag;     // 0 or 1 — player reached the exit cell this turn
 
     // ── Public output ──────────────────────────────────────────────────────────
     signal output pi_hash;
@@ -225,9 +232,16 @@ template TurnValidity() {
     pos_commit_after <== pcom_after.out;
 
     // ────────────────────────────────────────────────────────────────────────
-    // Step 7: pi_hash = Poseidon2(h1, h2)
+    // Step 7: Exit constraint
+    // If exited_flag = 1, the player's end position must match the exit cell.
+    // ────────────────────────────────────────────────────────────────────────
+    exited_flag * (end_x - exit_x) === 0;
+    exited_flag * (end_y - exit_y) === 0;
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Step 8: pi_hash = Poseidon2(h1, h2)
     //   h1 = Poseidon4(session_id, turn_index, player_tag, pos_commit_before)
-    //   h2 = Poseidon4(pos_commit_after, score_delta, loot_delta, no_path_flag)
+    //   h2 = Poseidon5(pos_commit_after, score_delta, loot_delta, no_path_flag, exited_flag)
     // ────────────────────────────────────────────────────────────────────────
     component h1 = Poseidon(4);
     h1.inputs[0] <== session_id;
@@ -235,11 +249,12 @@ template TurnValidity() {
     h1.inputs[2] <== player_tag;
     h1.inputs[3] <== pos_commit_before;
 
-    component h2 = Poseidon(4);
+    component h2 = Poseidon(5);
     h2.inputs[0] <== pos_commit_after;
     h2.inputs[1] <== score_delta;
     h2.inputs[2] <== loot_delta;
     h2.inputs[3] <== no_path_flag;
+    h2.inputs[4] <== exited_flag;
 
     component pi_hasher = Poseidon(2);
     pi_hasher.inputs[0] <== h1.out;
