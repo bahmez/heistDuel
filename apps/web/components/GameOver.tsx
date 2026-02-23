@@ -5,9 +5,12 @@ import type { PlayerGameView } from "@repo/stellar";
 interface GameOverProps {
   view: PlayerGameView;
   playerAddress: string;
+  contractId?: string;
+  sessionId?: number | null;
+  network?: string;
 }
 
-export function GameOver({ view, playerAddress }: GameOverProps) {
+export function GameOver({ view, playerAddress, contractId, sessionId, network = "testnet" }: GameOverProps) {
   const isPlayer1 = playerAddress === view.player1;
   const isWinner  = view.winner === playerAddress;
 
@@ -102,6 +105,36 @@ export function GameOver({ view, playerAddress }: GameOverProps) {
             </span>
           </div>
         </div>
+
+        {/* Explorer link */}
+        {contractId && (
+          <div className="rounded-xl bg-heist-darker border border-heist-border/50 p-3 space-y-1">
+            <p className="text-xs text-gray-500 uppercase tracking-wider font-semibold">
+              On-chain contract
+            </p>
+            <div className="flex items-center justify-between gap-2">
+              <span className="font-mono text-xs text-gray-400 truncate">
+                {contractId.slice(0, 8)}…{contractId.slice(-8)}
+                {sessionId != null && (
+                  <span className="text-gray-600 ml-1">#{sessionId}</span>
+                )}
+              </span>
+              <a
+                href={`https://stellar.expert/explorer/${network}/contract/${contractId}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex-shrink-0 flex items-center gap-1 text-xs text-heist-blue hover:text-white transition-colors"
+              >
+                <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+                  <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+                  <polyline points="15 3 21 3 21 9" />
+                  <line x1="10" y1="14" x2="21" y2="3" />
+                </svg>
+                stellar.expert
+              </a>
+            </div>
+          </div>
+        )}
 
         <a
           href="/"

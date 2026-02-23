@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import type { PlayerGameView } from "@repo/stellar";
 import type { TurnBreakdown } from "../lib/turn-builder";
 
@@ -39,43 +39,55 @@ function TurnRow({ t }: { t: TurnBreakdown }) {
   );
 }
 
-/**
- * Compute the effective seconds remaining for the current player's turn,
- * accounting for the time already elapsed since the turn started.
- *
- * The on-chain clock is only decremented when submit_turn is called;
- * we compute the live value client-side to give a real-time countdown.
- */
-function computeEffectiveTimeLeft(
-  remainingSeconds: number,
-  lastTurnStartTs: number,
-  isMyTurn: boolean,
-): number {
-  if (!isMyTurn) return remainingSeconds;
-  const nowSec = Math.floor(Date.now() / 1000);
-  const elapsed = Math.max(0, nowSec - lastTurnStartTs);
-  return Math.max(0, remainingSeconds - elapsed);
-}
-
 export function ScorePanel({ view, playerAddress, turnHistory = [] }: ScorePanelProps) {
   const isPlayer1 = playerAddress === view.player1;
-  const isMyTurn  = view.activePlayer === playerAddress;
+  const isMyTurn  = view.activePlayer === playerAddress && view.status === "Active";
 
-  // Per-player chess clock — only show own time (opponent's is hidden by design).
-  const [myTimeLeft, setMyTimeLeft] = useState<number>(
-    computeEffectiveTimeLeft(view.myTimeRemaining, view.lastTurnStartTs, isMyTurn),
+  /**
+   * Client-side timestamp (seconds) recorded the moment we first detect it is
+   * our turn. Using the client wall-clock avoids penalising the player for the
+   * polling lag between when the server advances the turn and when we receive
+   * the updated game state.
+   *
+   * The countdown formula is:
+   *   displayed = view.myTimeRemaining − (Date.now()/1000 − myTurnClientStart)
+   *
+   * When it is NOT our turn the timer simply shows the server-stored value
+   * (no subtraction), so the opponent's thinking time never counts against us.
+   */
+  const myTurnClientStartRef = useRef<number | null>(
+    isMyTurn ? Math.floor(Date.now() / 1000) : null,
   );
+  const prevIsMyTurnRef = useRef<boolean>(isMyTurn);
+
+  // Track transition into / out of our turn without triggering a re-render.
+  useEffect(() => {
+    if (isMyTurn && !prevIsMyTurnRef.current) {
+      // Just became our turn — record client wall-clock as the countdown base.
+      myTurnClientStartRef.current = Math.floor(Date.now() / 1000);
+    } else if (!isMyTurn && prevIsMyTurnRef.current) {
+      // Turn ended — clear the reference so it is re-set on the next turn.
+      myTurnClientStartRef.current = null;
+    }
+    prevIsMyTurnRef.current = isMyTurn;
+  }, [isMyTurn]);
+
+  const computeTimeLeft = () => {
+    if (!isMyTurn) return view.myTimeRemaining;
+    const start = myTurnClientStartRef.current ?? Math.floor(Date.now() / 1000);
+    const elapsed = Math.max(0, Math.floor(Date.now() / 1000) - start);
+    return Math.max(0, view.myTimeRemaining - elapsed);
+  };
+
+  const [myTimeLeft, setMyTimeLeft] = useState<number>(computeTimeLeft);
 
   useEffect(() => {
-    const update = () => {
-      setMyTimeLeft(
-        computeEffectiveTimeLeft(view.myTimeRemaining, view.lastTurnStartTs, isMyTurn),
-      );
-    };
+    const update = () => setMyTimeLeft(computeTimeLeft());
     update();
     const interval = setInterval(update, 1000);
     return () => clearInterval(interval);
-  }, [view.myTimeRemaining, view.lastTurnStartTs, isMyTurn]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view.myTimeRemaining, isMyTurn]);
 
   const formatTime = (seconds: number) => {
     const m = Math.floor(seconds / 60);

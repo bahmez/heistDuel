@@ -14,7 +14,7 @@ import { MAP_W, MAP_H } from '@repo/stellar'
 type ViewMode = 'angled' | 'topdown'
 
 const CAMERA_CONFIGS: Record<ViewMode, { position: [number, number, number]; target: [number, number, number] }> = {
-  angled:  { position: [0, 15, 21],    target: [0, 0, 0] },
+  angled:  { position: [0, 11, 15],    target: [0, 0, 0] },
   topdown: { position: [0, 36, 0.01],  target: [0, 0, 0] },
 }
 

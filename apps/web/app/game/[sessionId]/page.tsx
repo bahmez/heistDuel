@@ -77,6 +77,16 @@ export default function GamePage({
   const [turnError, setTurnError] = useState<string | null>(null);
   const [joining, setJoining] = useState(false);
 
+  // Runtime config for explorer link in GameOver popup
+  const [contractId, setContractId] = useState<string | undefined>(undefined);
+  const [network, setNetwork] = useState<string>("testnet");
+  useEffect(() => {
+    getRuntimeConfig().then((cfg) => {
+      if (cfg.heistContractId) setContractId(cfg.heistContractId);
+      if (cfg.network) setNetwork(cfg.network);
+    }).catch(() => {});
+  }, []);
+
   const advancePosNonce = usePrivateStore((s) => s.advancePosNonce);
   const mapSeedReady    = usePrivateStore((s) => !!s.mapSeed);
   const posNonceReady   = usePrivateStore((s) => !!s.posNonce);
@@ -461,7 +471,13 @@ export default function GamePage({
         </aside>
 
         {game.view.status === "Ended" && (
-          <GameOver view={game.view} playerAddress={address!} />
+          <GameOver
+            view={game.view}
+            playerAddress={address!}
+            contractId={contractId}
+            sessionId={game.sessionId}
+            network={network}
+          />
         )}
       </div>
     );
