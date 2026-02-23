@@ -21,7 +21,7 @@ const CAMERA_CONFIGS: Record<ViewMode, { position: [number, number, number]; tar
 // ─── Renderer & lighting config ───────────────────────────────────────────────
 
 const LIGHTING_CONFIG = {
-  exposure: 0,
+  exposure: 1,
   ambientIntensity: 0.3,
   directIntensity: 2.5,
   ambientColor: '#ffffff',
