@@ -144,6 +144,7 @@ pnpm test:contracts
 
 ## Additional docs
 
+- API Swagger UI: https://api-main-423707247294.europe-west1.run.app/api/docs
 - Circuit docs: `apps/circuits/README.md`
 - Contract docs: `apps/contracts/README.md`
 - Script docs: `apps/contracts/scripts/README.md`
