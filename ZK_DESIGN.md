@@ -4,7 +4,7 @@
 
 HeistDuel is a two-player heist strategy game where **nothing about the game state is visible on-chain**: not the map layout, not the players' positions, not the path they took during a turn. Yet every turn is cryptographically proven to be valid.
 
-This is possible because every move is backed by a **ZK proof** (UltraHonk via Noir) that attests to the correctness of the move without revealing the private details. The blockchain only stores cryptographic commitments and verified proof identifiers — never raw game data.
+This is possible because every move is backed by a **ZK proof** (Groth16 via Circom/snarkjs) that attests to the correctness of the move without revealing the private details. The blockchain only stores cryptographic commitments and verified proof identifiers — never raw game data.
 
 ---
 
@@ -12,7 +12,7 @@ This is possible because every move is backed by a **ZK proof** (UltraHonk via N
 
 ### 1. Hidden Map (Commit-Reveal + ZK)
 
-**Problem**: If the game map (walls, loot, cameras, lasers) is stored on-chain, any observer can read it and play with complete information. That breaks the asymmetry of information that makes the game interesting.
+**Problem**: If the game map (walls, loot, cameras, lasers, exit cell) is stored on-chain, any observer can read it and play with complete information.
 
 **Solution — Double commit-reveal with backend relay:**
 
@@ -28,31 +28,27 @@ start_game(
 The secrets are never posted on-chain. Instead:
 
 1. Each player sends their raw secret to the backend.
-2. The backend verifies `keccak(secret_i) == pN_map_seed_commit` (checking against the on-chain commitment).
+2. The backend verifies `keccak(secret_i) == pN_map_seed_commit` against the on-chain commitment.
 3. The backend cross-relays: P1 receives `secret_2`, P2 receives `secret_1`.
 4. Each player independently computes:
    ```
-   map_seed = keccak256(secret_1 XOR secret_2)
-   map      = generateMap(map_seed)
+   map_seed       = keccak256(secret_1 XOR secret_2)
+   map            = generateMap(map_seed)   // walls, loot (cells < 127), cameras, lasers, exit
    map_commitment = keccak256(serialize(map))
    ```
 5. Both players sign `begin_match(map_commitment, p1_pos_commit, p2_pos_commit)`.
 
-The on-chain contract stores only `map_commitment`. No observer can reverse this commitment to learn the map. Neither player can use a different map — the ZK proof in each turn re-derives the map from the secrets and verifies that `keccak(generate_map(map_seed)) == map_commitment`.
+The on-chain contract stores only `map_commitment`. The circuit receives the map arrays as private inputs and verifies every turn's claims against them.
 
-**ZK guarantee**: The circuit proves that:
-- `keccak(map_secret_1) == p1_map_seed_commit` (on-chain)
-- `keccak(map_secret_2) == p2_map_seed_commit` (on-chain)
-- `map_seed = keccak(secret_1 XOR secret_2)`
-- `keccak(serialize(generate_map(map_seed))) == map_commitment` (on-chain)
+**Note on loot cell indices**: Loot is only generated at cells with flat index `y*12 + x < 127`. This keeps the on-chain loot bitmask representable as a non-negative `i128` (bit 127 would be the sign bit).
 
-This means the map used during the game is **cryptographically tied** to the on-chain commitments, without ever being revealed.
+**ZK guarantee (per turn)**: The circuit proves the path, loot count, score, and exit status are consistent with the private map arrays — without revealing the map itself.
 
 ---
 
 ### 2. Provable Randomness (Dice Rolls)
 
-**Problem**: If dice rolls rely on a server or on `env.prng()` (Soroban's non-deterministic PRNG), neither player can independently verify the fairness of the roll, and the formula cannot be reproduced inside a ZK circuit.
+**Problem**: Dice rolls must be deterministic, verifiable by both players, and non-manipulable.
 
 **Solution — Keccak256 deterministic PRNG:**
 
@@ -61,57 +57,44 @@ This means the map used during the game is **cryptographically tied** to the on-
 roll = keccak256(session_seed ‖ turn_index ‖ player_tag)[0] % 6 + 1
 ```
 
-```noir
-// Noir circuit
-fn roll_value(session_seed, turn_index, player_tag) -> u32 {
-    let h = keccak256_40(buf);
-    (h[0] as u32) % 6 + 1
-}
-```
-
-The `session_seed` is derived from both players' revealed seeds (via commit-reveal), so neither player controls it:
+The `session_seed` is derived from both players' revealed dice seeds (commit-reveal at `start_game` / `reveal_seed`):
 
 ```rust
 session_seed = keccak256(session_id ‖ seed_1 ‖ seed_2)
 ```
 
-**ZK guarantee**: The circuit verifies that `path_len <= rolled_value`. A player cannot claim to have moved more steps than the dice allowed. The dice computation is deterministic and verifiable by anyone who knows `session_seed` and `turn_index` — both of which become public after `begin_match`.
+This PRNG lives off-circuit (not in the ZK proof). The circuit instead receives `path_len` as a private input and proves the path is valid given the walls; the backend independently computes the expected roll and can reject turns where `path_len > roll`.
 
 **Properties:**
 - **Non-manipulable**: Neither player controls `session_seed` alone.
-- **Verifiable**: Any third party can recompute the roll from public data.
-- **ZK-compatible**: Pure Keccak — no randomness oracle or server required.
+- **Verifiable**: Any third party can recompute the roll from public data after `begin_match`.
+- **Off-circuit simplicity**: Keccak is not used inside the Poseidon-based circuit, keeping proof generation fast.
 
 ---
 
 ### 3. Private Position / Fog-of-War
 
-**Problem**: Storing coordinates on-chain reveals exactly where each player is, eliminating any strategic element of positioning.
+**Problem**: Storing coordinates on-chain reveals exactly where each player is.
 
-**Solution — Position commitments with private nonces:**
+**Solution — Poseidon position commitments with private nonces:**
 
-Position is never stored in cleartext. Instead:
+Position is stored as:
 
 ```
-pos_commit = keccak256(x ‖ y ‖ nonce)
+pos_commit = Poseidon3(x, y, nonce)
 ```
 
-The `nonce` is a private 32-byte value only the player knows. The on-chain contract stores only `pos_commit`. Nobody can determine the actual position (x, y) without knowing the nonce.
+The `nonce` is a private 32-byte BN254 Fr element (first byte always `0x00` to fit within the field). The on-chain contract stores only `pos_commit`. Nobody can determine `(x, y)` without knowing the nonce.
 
-The nonce rotates every turn:
+The nonce rotates every turn — the client generates a fresh random nonce for `pos_commit_after`. There is no deterministic nonce derivation; the new nonce is a fresh random BN254 Fr element chosen by the prover.
 
-```noir
-// In circuit
-new_pos_nonce = keccak256(pos_nonce ‖ turn_index_BE)
-pos_commit_after = keccak256(end_x ‖ end_y ‖ new_pos_nonce)
-```
+**Why Poseidon (not Keccak)?** Poseidon is an algebraic hash function designed to be efficient inside ZK circuits over BN254. Each Poseidon call costs O(1) circuit constraints, while Keccak inside a circuit would cost thousands. Using Poseidon for position commitments means the circuit can verify `pos_commit_before` and `pos_commit_after` with negligible overhead.
+
+**On-chain verification**: The Soroban contract uses `soroban-poseidon` (BN254/Groth16-compatible Poseidon) to compute the same hash as the circuit, enabling it to verify position commitments and compute the expected `pi_hash`.
 
 **ZK guarantee**: The circuit proves:
-- `pos_commit_before = keccak(pos_x, pos_y, pos_nonce)` — the player actually started where they claimed.
-- `pos_commit_after = keccak(end_x, end_y, new_pos_nonce)` — the player ended at a position reachable from their start given the path.
-- `new_pos_nonce = keccak(pos_nonce ‖ turn_index)` — the nonce rotation is deterministic and non-replayable.
-
-This implements **fog-of-war**: both players see only commitment values on-chain, not coordinates.
+- `pos_commit_before = Poseidon3(pos_x, pos_y, pos_nonce)` — player started where they claimed.
+- `pos_commit_after = Poseidon3(end_x, end_y, new_pos_nonce)` — player ended at the correct position given the path.
 
 ---
 
@@ -119,43 +102,77 @@ This implements **fog-of-war**: both players see only commitment values on-chain
 
 **Problem**: How can the blockchain accept a score update without knowing the path the player took, which walls they passed, or which loot they collected?
 
-**Solution — The `turn_validity` Noir circuit:**
+**Solution — The `turn_validity` Groth16/Circom circuit:**
 
-Every turn, the player generates a ZK proof locally. The circuit takes **private inputs** (map secrets, position, path, nonces) and **proves public outputs** (score_delta, loot_delta, pos_commit_after) are correctly derived.
+Every turn, the player generates a Groth16 proof locally (via snarkjs in the browser or on the proof API). The circuit takes **private inputs** (map arrays, position, path, nonces) and produces a **single public output** (`pi_hash`) that commits to all claimed turn data.
 
-Specifically, the circuit asserts:
+**Circuit inputs:**
 
-| Step | What is proven | Private data used |
+| Signal | Type | Description |
 |---|---|---|
-| 1 | pi_hash binds all claimed public outputs | — |
-| 2 | Map seed commitments match secrets | `map_secret_1`, `map_secret_2` |
-| 3 | Map is correctly generated from seeds | Both secrets |
-| 4 | map_commitment matches generated map | Serialized map |
-| 5 | pos_commit_before is valid | `pos_x`, `pos_y`, `pos_nonce` |
-| 6 | Dice roll allows the path length | `session_seed` |
-| 7 | path_len == 0 when no_path_flag is set | `path_x`, `path_y` |
-| 8 | Path starts at current position | `pos_x`, `pos_y` |
-| 9 | Each step is adjacent, in-bounds, no wall | Full path + wall bitset |
-| 10 | loot_delta is correctly counted | Loot bitset + path |
-| 11 | camera_hits, laser_hits are correct | Camera/laser positions + path |
-| 12 | score_delta = loot - cameras - 2×lasers | All of the above |
-| 13 | new_pos_nonce is correctly derived | `pos_nonce`, `turn_index` |
-| 14 | pos_commit_after = keccak(end_x, end_y, new_nonce) | New position + nonce |
+| `map_walls[18]` | private | Wall bitset (18 bytes, 144 cells) |
+| `map_loot[18]` | private | Loot bitset (18 bytes, cells < 127 only) |
+| `pos_x`, `pos_y` | private | Player's start position |
+| `pos_nonce` | private | BN254 Fr nonce for `pos_commit_before` |
+| `path_x[7]`, `path_y[7]` | private | Path coordinates (up to 6 steps + start) |
+| `path_len` | private | Number of steps taken (0–6) |
+| `new_pos_nonce` | private | Fresh BN254 Fr nonce for `pos_commit_after` |
+| `exit_x`, `exit_y` | private | Exit cell coordinates (from map seed) |
+| `session_id` | public | Identifies the game session |
+| `turn_index` | public | Turn counter (anti-replay) |
+| `player_tag` | public | 1 = player1, 2 = player2 |
+| `score_delta` | public | Net score change (BN254 Fr: negative → prime + value) |
+| `loot_delta` | public | Number of loot cells collected this turn |
+| `no_path_flag` | public | 1 if player has no valid moves |
+| `exited_flag` | public | 1 if player reached the exit cell this turn |
+
+**What the circuit proves:**
+
+| Step | Assertion |
+|---|---|
+| 1 | `pos_commit_before = Poseidon3(pos_x, pos_y, pos_nonce)` |
+| 2 | `path[0] = (pos_x, pos_y)` — path starts at current position |
+| 3 | Each active step is adjacent (Manhattan dist = 1), in-bounds, and not on a wall |
+| 4 | End position = `path[path_len]` — correctly extracted |
+| 5 | `loot_delta = count(path cells with loot bit set)` |
+| 6 | `pos_commit_after = Poseidon3(end_x, end_y, new_pos_nonce)` |
+| 7 | If `exited_flag = 1`: end position equals the exit cell |
+| 8 | `pi_hash = Poseidon2(h1, h2)` — binds all public outputs |
+
+**`pi_hash` construction:**
+```
+h1      = Poseidon4(session_id, turn_index, player_tag, pos_commit_before)
+h2      = Poseidon5(pos_commit_after, score_delta, loot_delta, no_path_flag, exited_flag)
+pi_hash = Poseidon2(h1, h2)
+```
 
 **On-chain verification flow:**
 
 ```
 submit_turn(session_id, player, proof_blob, TurnZkPublic)
-  ├── Verify player is active player
+  ├── Check player is active player (not already exited, not timed out)
+  ├── Deduct elapsed time from the active player's chess clock
   ├── Verify pos_commit_before == stored pos_commit (on-chain)
   ├── Verify state_commit_before == stored state_commitment (on-chain)
-  ├── Compute expected pi_hash from TurnZkPublic fields
-  ├── Verify proof_blob[4..36] == expected pi_hash
-  ├── Call ZkVerifier.verify_proof_with_stored_vk(proof_blob)  ← UltraHonk
-  └── Apply proven state: update score, pos_commit, loot_count, state_commitment
+  ├── Compute expected pi_hash from TurnZkPublic via soroban-poseidon
+  ├── Verify proof_blob[4..36] == expected pi_hash (Groth16 public input)
+  ├── Call ZkVerifier.verify_proof_with_stored_vk(proof_blob)   ← Groth16 BN254
+  ├── Validate loot_mask: count_ones(loot_mask) == loot_delta, no overlap with game.loot_mask
+  └── Apply proven state: score, pos_commit, loot_mask, state_commitment
 ```
 
-**Key design**: Only one public input reaches the verifier — `pi_hash`, a Keccak256 hash of all claimed public turn data. This collapses the entire turn output into a single field element, keeping on-chain verification cost minimal while binding all outputs to the proof.
+**Proof blob format (292 bytes):**
+```
+[4 bytes]  n_pub = 0x00000001
+[32 bytes] pi_hash (big-endian BN254 Fr element)
+[64 bytes] π_A (BN254 G1 point)
+[128 bytes] π_B (BN254 G2 point)
+[64 bytes] π_C (BN254 G1 point)
+```
+
+**Key design**: The entire turn output is collapsed into a single field element (`pi_hash`). This minimises on-chain verification cost while cryptographically binding all claimed values (score, position, loot, exit) to the proof.
+
+**Score computation** is off-circuit. The circuit proves `loot_delta` (loot collected). Separately, the client reports `score_delta = loot_delta - camera_hits - 2×laser_hits`. Camera and laser hit detection happens off-chain (the client proves the path, from which hazard exposure can be independently computed — this is a current trust trade-off, see improvements section).
 
 ---
 
@@ -173,10 +190,34 @@ After a successful turn:
 game.state_commitment = state_commit_after
 ```
 
-This creates a **cryptographic chain** between turns — like a blockchain within the game. A turn's proof is only valid if the prover knows the exact state commitment produced by the previous turn. This prevents:
+The state commitment is a Keccak256 hash over all committed game values:
+
+```rust
+state_commitment = keccak256(
+    session_id ‖ turn_index ‖ player1_score ‖ player2_score ‖
+    map_commitment ‖ player1_pos_commit ‖ player2_pos_commit ‖ session_seed
+)
+```
+
+This creates a **cryptographic chain** between turns. A turn's proof is only valid if the prover knows the exact state produced by the previous turn:
 - **Replay attacks**: old proofs cannot be resubmitted (state_commit_before won't match)
 - **Out-of-order turns**: proofs must be submitted in sequence
-- **Turn skipping**: every transition must be proven
+- **Turn forgery**: every transition must be proven via circuit
+
+---
+
+### 6. Exit Mechanic and Game Termination
+
+**Exit cell**: Each map has exactly one exit cell, derived deterministically from the map seed. Its coordinates are private inputs to the circuit — never revealed on-chain. A player proves they reached the exit by setting `exited_flag = 1`, which the circuit enforces (`end_x == exit_x` and `end_y == exit_y`).
+
+**Game termination conditions:**
+1. Both players have exited → score comparison (higher score wins; earlier exit turn as tiebreaker).
+2. One player exited, the other's chess clock reached 0 → the exited player wins.
+3. Neither player exited, both clocks at 0 → score comparison (player 1 wins on equal score).
+
+**Auto-skip**: When a player exits, subsequent turns in which they would be active are automatically skipped on-chain inside `submit_turn`. The backend does not need to call `pass_turn` explicitly.
+
+**Chess clock**: Each player has 5 minutes of total thinking time (summed across all their turns). Time is deducted in `submit_turn` based on the ledger timestamp delta since the last turn started. `end_if_finished` also accounts for elapsed time when called externally.
 
 ---
 
@@ -188,46 +229,59 @@ This creates a **cryptographic chain** between turns — like a blockchain withi
 | Scores (cumulative) | ✅ public | — |
 | Turn index | ✅ public | — |
 | Active player | ✅ public | — |
+| Winner | ✅ public (after end) | — |
 | Map commitment | ✅ public | Map layout ❌ |
 | Map seed commits | ✅ public | Both secrets ❌ |
 | Position commitments | ✅ public | x, y, nonces ❌ |
 | State commitment | ✅ public | Derivation details ❌ |
-| Loot count (total) | ✅ public | Which cells ❌ |
-| Proof identifier (hash) | ✅ public | Proof bytes (only submitter needs) |
+| Loot bitmask (collected cells) | ✅ public (as i128) | Which player collected which ❌ |
+| Loot count (total) | ✅ public | — |
+| Proof identifier (hash) | ✅ public | Proof bytes (submitter only) |
 | Session seed | ✅ public (after begin_match) | — |
+| Per-player chess clock | ✅ public | — |
+| Exited flags | ✅ public | Exit cell location ❌ |
 | Path taken | ❌ never | Player only |
-| Hazard hits breakdown | ❌ never | Player only |
+| Camera/laser hit breakdown | ❌ never | Player only |
+| Exit cell coordinates | ❌ never | Derived locally from map seed |
 
 ---
 
-## Remaining Improvements
+## Architecture & Proof Pipeline
 
-### 1. Frontend proof generation
+### Proof Generation
 
-**Current state**: Fully implemented. The proof generation pipeline is:
+```
+Browser / Turn Builder
+  ├── computeLootDelta(map.loot, lootCollected, path)   → lootMaskDelta (Uint8Array)
+  ├── computeCameraHits(path, map.cameras)              → cameraHits
+  ├── computeLaserHits(path, map.lasers)                → laserHits
+  ├── scoreDelta = lootDelta - cameraHits - 2×laserHits
+  ├── exitedFlag = (end == exitCell)
+  └── POST /api/proof/prove  { mapWalls, mapLoot, posX, posY, posNonce,
+                               pathX, pathY, pathLen, newPosNonce, exitX, exitY,
+                               sessionId, turnIndex, playerTag,
+                               scoreDelta, lootDelta, noPathFlag, exitedFlag }
 
-1. **Private store** (`apps/web/stores/private-store.ts`) — holds map secrets, session seed, and position nonce locally in the browser.
-2. **Lobby store** (`apps/web/stores/lobby-store.ts`) — generates dice and map seed secrets at create/join, sends commitments to the backend.
-3. **Relay phase handler** (`apps/web/lib/use-game.ts`) — when the lobby enters `relaying`, automatically exchanges map secrets, derives `mapSeed`, derives initial position nonces from `mapSeed` (so both players independently compute identical initial pos commits), and calls `begin-match`. Stores `sessionSeed` (returned by the backend) and `posNonce` in the private store.
-4. **Turn builder** (`apps/web/lib/turn-builder.ts`) — computes all ZK inputs from local state, calls `POST /api/proof/prove` on the backend, wraps the raw proof with `wrapProofBlob`, and builds the `submit_turn` transaction.
-5. **Proof endpoint** (`apps/api/src/proof/proof.service.ts`, `proof.controller.ts`) — `POST /api/proof/prove` receives all private + public inputs, writes a `Prover.toml`, runs `nargo execute` (witness) + `bb prove` (proof), and returns raw proof bytes.
+Proof API (NestJS)
+  ├── Builds Groth16 witness via snarkjs + compiled circuit WASM
+  ├── Generates Groth16 proof using the final zkey (turn_validity_final.zkey)
+  ├── Extracts pi_hash from public signals
+  └── Wraps into 292-byte proof_blob: [n_pub=1][pi_hash][π_A][π_B][π_C]
 
-**Performance**: Proof generation takes 2-5 minutes for this circuit (80 wall + 160 loot Keccak iterations). The frontend shows a live status indicator. The backend falls back gracefully to a mock proof if the binaries are not available (dev mode).
+Browser
+  └── buildSubmitTurnTx(player, proof_blob, TurnZkPublic)
+       └── Soroban simulate → sign → submit
+```
 
-**Binary configuration**: Set `NARGO_PATH` and `BB_PATH` env vars on the API server (defaults to `~/.nargo/bin/nargo` and `~/.bb/bb`). Use the existing `docker_gen_vk.sh` as a reference for installing the correct Barretenberg version.
+### On-Chain Verification (ZkVerifier contract)
 
----
+The `ZkVerifier` contract (`zk-verifier-core`) stores the Groth16 verification key (`vk`) and exposes:
 
-### 2. Backend relay trust model
+```rust
+verify_proof_with_stored_vk(proof_blob: Bytes) -> BytesN<32>
+```
 
-**Current state**: The backend verifies map secret commitments against on-chain values before relaying. However, the backend is a **trusted relay** — it sees both players' raw map secrets temporarily.
-
-**Mitigation already in place**:
-- Secrets are deleted from the backend database immediately after `begin_match` is confirmed.
-- The backend verifies `keccak(secret_i) == pN_map_seed_commit` before relaying.
-- Players can verify their opponent's secret locally after receiving it.
-
-**Theoretical improvement**: Eliminate the trusted backend entirely using on-chain encrypted channels (e.g., ECIES with player public keys). Each player encrypts their secret with the opponent's public key and posts it on-chain. The opponent decrypts locally. This removes the backend from the trust model entirely but requires additional on-chain storage and player key management.
+It uses Soroban Protocol 25's native BN254 host functions (`pairing_check`, `g1_add`, `g1_mul`, `g2_add`) to perform the full Groth16 verification on-chain, returning the proof's Keccak256 hash as a unique `proof_id`.
 
 ---
 
@@ -235,24 +289,55 @@ This creates a **cryptographic chain** between turns — like a blockchain withi
 
 | Layer | Technology | Purpose |
 |---|---|---|
-| ZK Circuit | Noir 1.0.0-beta.18 | Turn validity proof (private path, map, positions) |
-| Proof System | UltraHonk (Barretenberg 3.0.0-nightly) | Proof generation + on-chain verification |
-| Smart Contracts | Soroban/Rust (soroban-sdk 22.0.7) | On-chain state, commitment verification |
-| Hash Function | Keccak-256 | Commitments + PRNG (available in Soroban & Noir) |
-| Backend | NestJS | Map secret relay, lobby coordination |
-| Frontend | Next.js + Stellar Wallets Kit | Player interface, commitment computation |
+| ZK Circuit | Circom 2.1.6 + circomlib | Turn validity proof (path, position, loot, exit) |
+| Proof System | Groth16 / BN254 (snarkjs) | Proof generation (off-chain, ~2–5 s) |
+| On-chain Verifier | Soroban BN254 host functions | Native Groth16 verification |
+| Hash (commitments) | Poseidon over BN254 | Position commits, pi_hash (circuit-friendly) |
+| Hash (PRNG / state) | Keccak-256 | Dice rolls, state commitment, map commit |
+| Smart Contract | Soroban/Rust (soroban-sdk 22) | On-chain state, chess clock, loot mask |
+| Backend | NestJS + snarkjs | Proof generation endpoint, lobby relay |
+| Frontend | Next.js + Stellar Wallets Kit | Turn submission, private state management |
 | Blockchain | Stellar Testnet | Contract hosting, GameHub integration |
+
+---
+
+## Current Trade-offs and Possible Improvements
+
+### 1. Score delta trust model
+
+**Current state**: `score_delta = loot_delta - camera_hits - 2×laser_hits`. The circuit proves `loot_delta` (loot cells visited). Camera and laser hits are computed off-chain by the client and included in `score_delta`; the contract accepts the claimed `score_delta` without circuit-level proof of hazard exposure.
+
+**Implication**: A dishonest client could undercount their hazard penalties and report a higher score than deserved. This is a known trade-off: adding hazard verification inside the circuit would require significantly more constraints.
+
+**Mitigation**: The opponent can observe the submitted `pos_commit_before` / `pos_commit_after` chain over time and detect anomalous score trajectories. A future circuit upgrade could add camera/laser hit verification.
+
+### 2. Backend relay trust model
+
+**Current state**: The backend verifies map seed commitments against on-chain values before relaying, but temporarily sees both players' raw map secrets.
+
+**Mitigation already in place**:
+- Secrets are deleted from the backend immediately after `begin_match` is confirmed.
+- The backend verifies `keccak(secret_i) == pN_map_seed_commit` before relaying.
+
+**Theoretical improvement**: Eliminate the trusted backend using on-chain encrypted channels (e.g., ECIES). Each player encrypts their secret with the opponent's on-chain public key and posts the ciphertext. The opponent decrypts locally, removing the backend from the trust model entirely.
+
+### 3. Loot cell restriction
+
+**Current state**: Loot is only placed at cells with flat index `y*12 + x < 127`. This is a constraint imposed by representing the global loot bitmask as an `i128` on-chain (bit 127 is the sign bit). Cells 127–143 are never used for loot.
+
+**Impact**: In the 12×12 grid (144 cells), 17 cells (row y=10 from x=7 onward, and all of row y=11) cannot hold loot. With 24 loot items placed across the remaining 127 eligible cells, gameplay is not materially affected.
 
 ---
 
 ## Summary
 
-HeistDuel uses ZK proofs as the **only way** to advance the game state. There is no server-side validation of moves, no trust in any off-chain authority for turn correctness, and no on-chain data that reveals the map or player positions. The ZK proof is not an add-on — it is the game's enforcement mechanism.
+HeistDuel uses ZK proofs as the **only way** to advance the game state. There is no server-side validation of moves, no trust in any off-chain authority for turn correctness, and no on-chain data that reveals the map or player positions.
 
-The commitment chain, combined with the double commit-reveal for map generation, ensures that:
+The Groth16 circuit over BN254, combined with Poseidon-based position commitments and a Keccak-based state chain, ensures that:
 - The map cannot be fabricated or modified mid-game
 - Positions cannot be teleported
 - Dice rolls cannot be manipulated
-- Score calculations cannot be falsified (`score_delta` byte consistency is now proven in-circuit)
+- Loot counts cannot be inflated (circuit-proven)
+- Exit claims cannot be faked (exit cell is a circuit constraint)
 
-This makes HeistDuel a **genuinely private two-player game with verifiable outcomes** - a player wins because they collected more loot while avoiding hazards, and that fact is cryptographically proven, not asserted.
+This makes HeistDuel a **genuinely private two-player game with verifiable outcomes** — a player wins because they collected more loot while avoiding hazards and escaped the map first, and that outcome is cryptographically proven, not asserted.

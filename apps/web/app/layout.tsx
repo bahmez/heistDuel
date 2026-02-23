@@ -3,7 +3,7 @@ import type { ReactNode } from "react";
 import "./globals.css";
 import { WalletProvider } from "../lib/wallet-context";
 
-const BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3000";
+const BASE_URL = process.env.NEXT_PUBLIC_APP_URL ?? "https://web-main-423707247294.europe-west1.run.app";
 
 export const metadata: Metadata = {
   title: "Heist Duel — ZK Heist Game on Stellar",
