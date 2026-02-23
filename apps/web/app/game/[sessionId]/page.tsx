@@ -7,7 +7,7 @@ import { useLobbyStore } from "../../../stores/lobby-store";
 import { useGameStore } from "../../../stores/game-store";
 import { WalletButton } from "../../../components/WalletButton";
 import { LobbyWaiting } from "../../../components/LobbyWaiting";
-import { GameBoard } from "../../../components/GameBoard";
+import { GameBoard3D } from "../../../components/GameBoard3D";
 import { DiceRoll } from "../../../components/DiceRoll";
 import { TurnControls } from "../../../components/TurnControls";
 import { ScorePanel } from "../../../components/ScorePanel";
@@ -384,80 +384,81 @@ export default function GamePage({
   // Active or ended game
   if (game.view) {
     return (
-      <div className="min-h-screen flex flex-col">
-        <header className="flex items-center justify-between px-6 py-4 border-b border-heist-border">
+      <div className="relative w-screen h-screen overflow-hidden bg-[#050810]">
+        {/* ── 3D canvas fills the entire screen ── */}
+        <GameBoard3D
+          view={game.view}
+          playerAddress={address!}
+          roll={game.roll}
+          selectedPath={selectedPath}
+          onCellClick={handleCellClick}
+          isMyTurn={isMyTurn}
+        />
+
+        {/* ── Top header ── */}
+        <header className="absolute top-0 left-0 right-0 z-10 flex items-center justify-between px-6 py-3 bg-heist-darker/80 backdrop-blur-sm border-b border-heist-border/50">
           <a href="/" className="text-xl font-bold text-white">
             <span className="text-heist-green">Heist</span> Duel
           </a>
           <WalletButton />
         </header>
 
-        <div className="flex-1 flex flex-col lg:flex-row gap-4 p-4 items-start justify-center">
-          <GameBoard
-            view={game.view}
-            playerAddress={address!}
-            roll={game.roll}
+        {/* ── GUI panel — bottom-right ── */}
+        <aside className="absolute bottom-4 right-4 z-10 w-72 space-y-3 max-h-[calc(100vh-5rem)] overflow-y-auto pb-1 pr-1">
+          <ScorePanel view={game.view} playerAddress={address!} turnHistory={turnHistory} />
+          <DiceRoll value={game.roll} isMyTurn={isMyTurn} />
+
+          {!zkSecretsReady && game.view?.status === "Active" && (
+            <div className="rounded-lg bg-yellow-500/10 border border-yellow-500/30 p-3 text-sm text-yellow-400 flex items-center gap-2">
+              <svg className="animate-spin h-4 w-4 flex-shrink-0" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+              </svg>
+              <span>ZK secrets loading… map will appear shortly.</span>
+            </div>
+          )}
+
+          <TurnControls
+            isMyTurn={isMyTurn && zkSecretsReady}
             selectedPath={selectedPath}
-            onCellClick={handleCellClick}
-            isMyTurn={isMyTurn}
+            roll={game.roll}
+            onSubmit={handleSubmitTurn}
+            onSkip={handleSkipTurn}
+            onClear={handleClearPath}
+            submitting={submitting}
+            canSkip={canSkip && zkSecretsReady}
           />
 
-          <div className="w-full lg:w-72 space-y-4">
-            <ScorePanel view={game.view} playerAddress={address!} turnHistory={turnHistory} />
-            <DiceRoll value={game.roll} isMyTurn={isMyTurn} />
+          {provingStep && (
+            <div className="rounded-lg bg-heist-green/10 border border-heist-green/30 p-3 text-sm text-heist-green flex items-center gap-2">
+              <svg className="animate-spin h-4 w-4 flex-shrink-0" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+              </svg>
+              <span>{provingStep}</span>
+            </div>
+          )}
 
-            {!zkSecretsReady && game.view?.status === "Active" && (
-              <div className="rounded-lg bg-yellow-500/10 border border-yellow-500/30 p-3 text-sm text-yellow-400 flex items-center gap-2">
-                <svg className="animate-spin h-4 w-4 flex-shrink-0" viewBox="0 0 24 24">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                </svg>
-                <span>ZK secrets loading… map will appear shortly.</span>
-              </div>
-            )}
+          {turnError && (
+            <div className="rounded-lg bg-heist-red/10 border border-heist-red/30 p-3 text-sm text-heist-red">
+              {turnError}
+            </div>
+          )}
 
-            <TurnControls
-              isMyTurn={isMyTurn && zkSecretsReady}
-              selectedPath={selectedPath}
-              roll={game.roll}
-              onSubmit={handleSubmitTurn}
-              onSkip={handleSkipTurn}
-              onClear={handleClearPath}
-              submitting={submitting}
-              canSkip={canSkip && zkSecretsReady}
-            />
+          {game.error && (
+            <div className="rounded-lg bg-heist-red/10 border border-heist-red/30 p-3 text-sm text-heist-red">
+              {game.error}
+            </div>
+          )}
 
-            {provingStep && (
-              <div className="rounded-lg bg-heist-green/10 border border-heist-green/30 p-3 text-sm text-heist-green flex items-center gap-2">
-                <svg className="animate-spin h-4 w-4 flex-shrink-0" viewBox="0 0 24 24">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                </svg>
-                <span>{provingStep}</span>
-              </div>
-            )}
-
-            {turnError && (
-              <div className="rounded-lg bg-heist-red/10 border border-heist-red/30 p-3 text-sm text-heist-red">
-                {turnError}
-              </div>
-            )}
-
-            {game.error && (
-              <div className="rounded-lg bg-heist-red/10 border border-heist-red/30 p-3 text-sm text-heist-red">
-                {game.error}
-              </div>
-            )}
-
-            <button
-              onClick={game.refreshGameState}
-              disabled={game.loading}
-              className="w-full rounded-lg bg-heist-card border border-heist-border px-4 py-2 text-sm text-gray-400 hover:text-white transition-colors disabled:opacity-50"
-            >
-              {game.loading ? "Loading..." : "Refresh"}
-            </button>
-          </div>
-        </div>
+          <button
+            onClick={game.refreshGameState}
+            disabled={game.loading}
+            className="w-full rounded-lg bg-heist-card/80 backdrop-blur-sm border border-heist-border px-4 py-2 text-sm text-gray-400 hover:text-white transition-colors disabled:opacity-50"
+          >
+            {game.loading ? "Loading..." : "Refresh"}
+          </button>
+        </aside>
 
         {game.view.status === "Ended" && (
           <GameOver view={game.view} playerAddress={address!} />
