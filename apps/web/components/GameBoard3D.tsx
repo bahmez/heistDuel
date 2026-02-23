@@ -643,9 +643,7 @@ export function GameBoard3D(props: GameBoard3DProps) {
           </>
         )}
 
-        <ambientLight intensity={0.6} />
-        <directionalLight position={[12, 18, 10]} intensity={1.4} castShadow />
-        <directionalLight position={[-8, 8, -5]} intensity={0.3} />
+        <ambientLight intensity={1} />
 
         <Suspense fallback={null}>
           <GameScene3D {...props} />

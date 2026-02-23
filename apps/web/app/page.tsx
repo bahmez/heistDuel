@@ -175,7 +175,7 @@ export default function HomePage() {
                 </RuleStep>
 
                 <RuleStep n={2} title="Your turn">
-                  A die (1–6) is rolled automatically. Move your character
+                  A dice (1–6) is rolled automatically. Move your character
                   exactly that many steps through revealed cells. You can only
                   move through cells you have already explored.
                 </RuleStep>

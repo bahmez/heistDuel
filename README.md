@@ -3,6 +3,8 @@
 HeistDuel is a two-player strategy game on Stellar/Soroban where turn validity is proven with zero-knowledge proofs.  
 Players keep map details and exact movement private while the contracts enforce valid state transitions.
 
+**[▶ Play demo](https://web-main-423707247294.europe-west1.run.app)** — Running on Stellar Testnet
+
 ## Architecture
 
 | Layer | Responsibility |
